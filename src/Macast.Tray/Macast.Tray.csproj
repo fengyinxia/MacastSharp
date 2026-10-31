@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>macast-gui</AssemblyName>
+    <RootNamespace>Macast.Tray</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Macast.Core\Macast.Core.csproj" />
+    <EmbeddedResource Include="..\Macast.Core\Assets\icon.ico" LogicalName="Macast.Tray.icon.ico" />
+  </ItemGroup>
+</Project>

@@ -1,0 +1,9 @@
+bin/
+obj/
+.vs/
+*.user
+*.suo
+
+# 打包产物（publish / zip 输出）
+dist/
+*.zip
