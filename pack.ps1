@@ -53,7 +53,11 @@ if ($LASTEXITCODE -ne 0) { throw 'macast-gui publish failed' }
 Copy-Item (Join-Path $root 'src\Macast.Core\Assets\*') (Join-Path $dist 'Assets') -Recurse -Force
 
 # Documentation and licence shipped next to the executables.
-$license = Join-Path (Split-Path -Parent $root) 'LICENSE'
+# Prefer the licence inside this project, fall back to the parent repository layout.
+$license = Join-Path $root 'LICENSE'
+if (-not (Test-Path $license)) {
+    $license = Join-Path (Split-Path -Parent $root) 'LICENSE'
+}
 if (Test-Path $license) {
     Copy-Item $license (Join-Path $dist 'LICENSE') -Force
 }
