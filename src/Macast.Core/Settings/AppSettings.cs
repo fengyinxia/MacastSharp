@@ -1,6 +1,6 @@
+using System.Collections.Concurrent;
 using System.Text.Json;
 using System.Text.Json.Nodes;
-using System.Text.Json.Serialization;
 using Macast.Core.Utils;
 
 namespace Macast.Core.Settings;
@@ -20,7 +20,8 @@ public sealed class AppSettings
 
     public static string SettingPath => Path.Combine(ConfigDir, "macast_setting.json");
 
-    private Dictionary<string, JsonNode?> _values = new(StringComparer.Ordinal);
+    private readonly object _saveGate = new();
+    private ConcurrentDictionary<string, JsonNode?> _values = new(StringComparer.Ordinal);
 
     public string Version { get; } = AssetPaths.Version;
 
@@ -30,7 +31,8 @@ public sealed class AppSettings
 
     public string MpvDefaultPath { get; set; } = "mpv";
 
-    public IReadOnlyDictionary<string, JsonNode?> Values => _values;
+    public IReadOnlyDictionary<string, JsonNode?> Values =>
+        _values.ToDictionary(pair => pair.Key, pair => pair.Value?.DeepClone(), StringComparer.Ordinal);
 
     public string FriendlyName => TempFriendlyName ?? GetString("DLNA_FriendlyName", MachineFriendlyName);
 
@@ -45,7 +47,7 @@ public sealed class AppSettings
                 var dict = JsonSerializer.Deserialize<Dictionary<string, JsonNode?>>(json);
                 if (dict is not null)
                 {
-                    settings._values = new Dictionary<string, JsonNode?>(dict, StringComparer.Ordinal);
+                    settings._values = new ConcurrentDictionary<string, JsonNode?>(dict, StringComparer.Ordinal);
                 }
             }
         }
@@ -136,24 +138,26 @@ public sealed class AppSettings
 
     public void Set<T>(string key, T value)
     {
-        _values[key] = JsonSerializer.SerializeToNode(value);
+        lock (_saveGate)
+            _values[key] = JsonSerializer.SerializeToNode(value);
     }
 
     public void Save()
     {
-        try
+        lock (_saveGate)
         {
             Directory.CreateDirectory(ConfigDir);
-            var json = JsonSerializer.Serialize(_values, new JsonSerializerOptions
+            var path = SettingPath;
+            var temporary = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+            try
             {
-                WriteIndented = true,
-                DefaultIgnoreCondition = JsonIgnoreCondition.Never
-            });
-            File.WriteAllText(SettingPath, json);
-        }
-        catch (Exception ex)
-        {
-            Log.Error($"save settings failed: {ex.Message}");
+                File.WriteAllText(temporary, ToJson());
+                File.Move(temporary, path, overwrite: true);
+            }
+            finally
+            {
+                if (File.Exists(temporary)) File.Delete(temporary);
+            }
         }
     }
 
@@ -172,7 +176,8 @@ public sealed class AppSettings
 
     public string ToJson()
     {
-        return JsonSerializer.Serialize(_values, new JsonSerializerOptions { WriteIndented = true });
+        return JsonSerializer.Serialize(_values.ToArray().ToDictionary(pair => pair.Key, pair => pair.Value),
+            new JsonSerializerOptions { WriteIndented = true });
     }
 
     public void ReplaceFromJson(string json)
@@ -183,8 +188,17 @@ public sealed class AppSettings
             throw new JsonException("settings must be a JSON object");
         }
 
-        _values = new Dictionary<string, JsonNode?>(dict, StringComparer.Ordinal);
-        Save();
+        lock (_saveGate)
+        {
+            var previous = _values;
+            _values = new ConcurrentDictionary<string, JsonNode?>(dict, StringComparer.Ordinal);
+            try { Save(); }
+            catch
+            {
+                _values = previous;
+                throw;
+            }
+        }
     }
 
     private static int TryInt(JsonNode node, int fallback)

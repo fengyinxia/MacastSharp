@@ -12,6 +12,8 @@ public sealed class MacastApp : IAsyncDisposable
 {
     private readonly bool _loopbackOnly;
     private readonly bool _forceSimulation;
+    private readonly SemaphoreSlim _lifecycle = new(1, 1);
+    private bool _disposed;
     private CancellationTokenSource? _monitorCts;
     private Task? _monitorTask;
 
@@ -74,6 +76,17 @@ public sealed class MacastApp : IAsyncDisposable
 
     public async Task StartAsync(int? portOverride = null, CancellationToken cancellationToken = default)
     {
+        await _lifecycle.WaitAsync(cancellationToken);
+        try
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            await StartCoreAsync(portOverride, cancellationToken);
+        }
+        finally { _lifecycle.Release(); }
+    }
+
+    private async Task StartCoreAsync(int? portOverride, CancellationToken cancellationToken)
+    {
         if (Running)
         {
             return;
@@ -107,7 +120,7 @@ public sealed class MacastApp : IAsyncDisposable
             Renderer.Start();
 
             _monitorCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            _monitorTask = Task.Run(() => MonitorNetworkAsync(_monitorCts.Token), _monitorCts.Token);
+            _monitorTask = MonitorNetworkAsync(_monitorCts.Token);
             Running = true;
 
             var ip = NetworkUtils.GetDefaultIp(Addresses);
@@ -126,6 +139,13 @@ public sealed class MacastApp : IAsyncDisposable
 
     public async Task StopAsync(CancellationToken cancellationToken = default)
     {
+        await _lifecycle.WaitAsync(cancellationToken);
+        try { await StopCoreAsync(); }
+        finally { _lifecycle.Release(); }
+    }
+
+    private async Task StopCoreAsync()
+    {
         if (!Running)
         {
             return;
@@ -136,7 +156,7 @@ public sealed class MacastApp : IAsyncDisposable
         {
             if (_monitorTask is not null)
             {
-                await _monitorTask.WaitAsync(TimeSpan.FromSeconds(2), cancellationToken);
+                await _monitorTask;
             }
         }
         catch (Exception ex) when (ex is TimeoutException or OperationCanceledException)
@@ -144,7 +164,10 @@ public sealed class MacastApp : IAsyncDisposable
             // normal shutdown
         }
 
-        await Ssdp.StopAsync(sendByeBye: true, cancellationToken);
+        _monitorCts?.Dispose();
+        _monitorCts = null;
+        _monitorTask = null;
+        await Ssdp.StopAsync(sendByeBye: true, CancellationToken.None);
         try
         {
             await Protocol.StopAsync();
@@ -166,45 +189,38 @@ public sealed class MacastApp : IAsyncDisposable
     /// </summary>
     public async Task RestartAsync(CancellationToken cancellationToken = default)
     {
-        var wasRunning = Running;
-        if (wasRunning)
+        await _lifecycle.WaitAsync(cancellationToken);
+        try
         {
-            await StopAsync(cancellationToken);
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            var wasRunning = Running;
+            await StopCoreAsync();
+            Renderer.Dispose();
+            await Protocol.DisposeAsync();
+            ProtocolPlugin = PluginRegistry.ResolveProtocol(Settings);
+            Protocol = ProtocolPlugin.Create(new ProtocolContext(Settings, _loopbackOnly));
+            RendererPlugin = PluginRegistry.ResolveRenderer(Settings);
+            Renderer = CreateRenderer(RendererPlugin);
+            Protocol.Renderer = Renderer;
+            if (wasRunning) await StartCoreAsync(null, cancellationToken);
         }
-
-        await Protocol.DisposeAsync();
-        ProtocolPlugin = PluginRegistry.ResolveProtocol(Settings);
-        Protocol = ProtocolPlugin.Create(new ProtocolContext(Settings, _loopbackOnly));
-        RendererPlugin = PluginRegistry.ResolveRenderer(Settings);
-        Renderer = CreateRenderer(RendererPlugin);
-        Protocol.Renderer = Renderer;
-
-        if (wasRunning)
-        {
-            await StartAsync(null, cancellationToken);
-        }
+        finally { _lifecycle.Release(); }
     }
 
     /// <summary>Swaps the renderer without touching the network (player window options).</summary>
-    public void ReloadRenderer()
+    public async Task ReloadRendererAsync(CancellationToken cancellationToken = default)
     {
+        await _lifecycle.WaitAsync(cancellationToken);
         try
         {
-            Renderer.Stop();
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            Renderer.Dispose();
+            Renderer = CreateRenderer(RendererPlugin);
+            Protocol.Renderer = Renderer;
+            if (Running) Renderer.Start();
+            Log.Info($"renderer reloaded: {RendererPlugin.Metadata.Id}");
         }
-        catch (Exception ex)
-        {
-            Log.Warn($"stop renderer failed: {ex.Message}");
-        }
-
-        Renderer = CreateRenderer(RendererPlugin);
-        Protocol.Renderer = Renderer;
-        if (Running)
-        {
-            Renderer.Start();
-        }
-
-        Log.Info($"renderer reloaded: {RendererPlugin.Metadata.Id}");
+        finally { _lifecycle.Release(); }
     }
 
     private async Task MonitorNetworkAsync(CancellationToken token)
@@ -261,16 +277,16 @@ public sealed class MacastApp : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
-        await StopAsync();
-        await Protocol.DisposeAsync();
-        await Ssdp.DisposeAsync();
+        await _lifecycle.WaitAsync();
         try
         {
-            Renderer.Stop();
+            if (_disposed) return;
+            await StopCoreAsync();
+            Renderer.Dispose();
+            await Protocol.DisposeAsync();
+            await Ssdp.DisposeAsync();
+            _disposed = true;
         }
-        catch
-        {
-            // ignore
-        }
+        finally { _lifecycle.Release(); }
     }
 }

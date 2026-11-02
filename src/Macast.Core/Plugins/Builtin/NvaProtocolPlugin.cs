@@ -10,7 +10,7 @@ public sealed class NvaProtocolPlugin : IProtocolPlugin
 {
     public MacastPlugin Metadata { get; } = new NvaMetadata();
 
-    public IProtocolService Create(ProtocolContext context) => new NvaProtocolService(context.Settings);
+    public IProtocolService Create(ProtocolContext context) => new NvaProtocolService(context.Settings, context.LoopbackOnly);
 
     private sealed class NvaMetadata : MacastPlugin
     {

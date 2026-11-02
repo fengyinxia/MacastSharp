@@ -19,6 +19,7 @@ internal static class SelfTest
     {
         var tempDir = Path.Combine(Path.GetTempPath(), "macast-cs-selftest-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(tempDir);
+        var previousConfig = Environment.GetEnvironmentVariable("MACAST_CONFIG_DIR");
         Environment.SetEnvironmentVariable("MACAST_CONFIG_DIR", tempDir);
 
         var failures = new List<string>();
@@ -216,6 +217,9 @@ internal static class SelfTest
                 Require(unsubscribed.StatusCode == HttpStatusCode.OK, "UNSUBSCRIBE status " + (int)unsubscribed.StatusCode);
             }, failures);
 
+            await BoundaryTests.RunAsync(app, http, failures);
+            await NvaTests.RunAsync(failures);
+
             await CheckAsync("restart lifecycle", async () =>
             {
                 var runningApp = app ?? throw new InvalidOperationException("app is null");
@@ -235,7 +239,7 @@ internal static class SelfTest
             {
                 var running = app ?? throw new InvalidOperationException("app is null");
                 var before = running.Renderer;
-                running.ReloadRenderer();
+                await running.ReloadRendererAsync();
                 Require(!ReferenceEquals(before, running.Renderer), "ReloadRenderer did not recreate the renderer");
                 Require(ReferenceEquals(running.Protocol.Renderer, running.Renderer),
                     "protocol.Renderer was not updated");
@@ -326,7 +330,7 @@ internal static class SelfTest
                 }
                 finally
                 {
-                    await service.StopAsync();
+                    await service.DisposeAsync();
                 }
             }, failures);
 
@@ -358,7 +362,7 @@ internal static class SelfTest
             {
                 try
                 {
-                    await app.StopAsync();
+                    await app.DisposeAsync();
                 }
                 catch (Exception ex)
                 {
@@ -366,6 +370,7 @@ internal static class SelfTest
                 }
             }
 
+            Environment.SetEnvironmentVariable("MACAST_CONFIG_DIR", previousConfig);
             try
             {
                 Directory.Delete(tempDir, recursive: true);
@@ -392,7 +397,7 @@ internal static class SelfTest
         return 1;
     }
 
-    private static async Task CheckAsync(string name, Func<Task> action, List<string> failures)
+    internal static async Task CheckAsync(string name, Func<Task> action, List<string> failures)
     {
         try
         {
@@ -406,7 +411,7 @@ internal static class SelfTest
         }
     }
 
-    private static void Require(bool condition, string message)
+    internal static void Require(bool condition, string message)
     {
         if (!condition)
         {

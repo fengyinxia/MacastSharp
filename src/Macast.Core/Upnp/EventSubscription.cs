@@ -11,6 +11,7 @@ public sealed class EventSubscription
     public string Callback { get; }
     public int TimeoutSeconds { get; private set; }
     public DateTime StartedAt { get; private set; } = DateTime.UtcNow;
+    public Task InitialEvent { get; set; } = Task.CompletedTask;
     public int Seq { get; set; }
     public int ErrorCount { get; set; }
     public SemaphoreSlim SendLock { get; } = new(1, 1);

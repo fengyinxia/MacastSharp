@@ -10,7 +10,7 @@ namespace Macast.Core.Renderer;
 /// the tray can start directly. The playlist is downloaded once and cached in
 /// the config directory, exactly like the Python plugin cached macast_live.m3u8.
 /// </summary>
-public sealed class LiveRenderer : IRenderer, IChannelListProvider, IAudioTrackRenderer
+public sealed class LiveRenderer : IRenderer, IChannelListProvider, IAudioTrackRenderer, ISegmentedRenderer
 {
     private static readonly HttpClient Http = new() { Timeout = TimeSpan.FromSeconds(10) };
     private readonly MpvRenderer _inner;
@@ -36,6 +36,8 @@ public sealed class LiveRenderer : IRenderer, IChannelListProvider, IAudioTrackR
 
     public void Stop() => _inner.Stop();
 
+    public void Dispose() => _inner.Dispose();
+
     public void SetMediaUrl(string url, string start = "0") => _inner.SetMediaUrl(url, start);
 
     public void SetMediaStop() => _inner.SetMediaStop();
@@ -52,6 +54,8 @@ public sealed class LiveRenderer : IRenderer, IChannelListProvider, IAudioTrackR
 
     public void SetMediaUrlWithAudio(string url, string start, string audioUrl) =>
         _inner.SetMediaUrlWithAudio(url, start, audioUrl);
+
+    public void SetMediaSegments(IReadOnlyList<MediaSegment> segments, string start) => _inner.SetMediaSegments(segments, start);
 
     public void SetMediaPosition(string position) => _inner.SetMediaPosition(position);
 

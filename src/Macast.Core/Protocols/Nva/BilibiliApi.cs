@@ -6,6 +6,7 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Xml.Linq;
 using Macast.Core.Utils;
+using Macast.Core.Renderer;
 
 namespace Macast.Core.Protocols.Nva;
 
@@ -26,7 +27,7 @@ public sealed record NvaPlayUrlRequest
     public int PlayUrlType { get; init; } = 1;
 
     /// <summary>
-    /// True for mpv-family renderers: request DASH (fnval=16) so qn above 1080P is
+    /// True for renderers with external audio support: request DASH (fnval=16) so HD is
     /// available, then attach the separate audio track. Otherwise durl is used.
     /// </summary>
     public bool PreferDash { get; init; }
@@ -49,7 +50,8 @@ public sealed record NvaPlayUrlRequest
 /// DASH responses carry the video and the audio as two URLs; AudioUrl is null for
 /// durl/live streams where the audio is embedded.
 /// </summary>
-public sealed record NvaPlayUrlResult(string? Url, JsonObject Qn, int CurrentQn, string? AudioUrl = null);
+public sealed record NvaPlayUrlResult(string? Url, JsonObject Qn, int CurrentQn, string? AudioUrl = null,
+    IReadOnlyList<MediaSegment>? Segments = null);
 
 /// <summary>One entry of the auto play list (nirvana.py: card/view_v2 -&gt; cid_list).</summary>
 public sealed record NvaPlayItem(string Aid, string Oid, string Cid, string Epid, string Title, bool IsPortrait);
@@ -238,6 +240,10 @@ public sealed class BilibiliApi
 
     private static readonly HttpClient DefaultClient = CreateClient(useProxy: true);
     private static readonly HttpClient DirectClient = CreateClient(useProxy: false);
+    private readonly HttpClient _client;
+
+    // The caller owns an injected client; production shares the standard client.
+    public BilibiliApi(HttpClient? client = null) => _client = client ?? DefaultClient;
 
     private static HttpClient CreateClient(bool useProxy)
     {
@@ -277,6 +283,7 @@ public sealed class BilibiliApi
             parameters[Uri.UnescapeDataString(pair[..equals])] = Uri.UnescapeDataString(pair[(equals + 1)..]);
         }
 
+        parameters.Remove("sign");
         parameters["appkey"] = AppKey;
         parameters["ts"] = DateTimeOffset.UtcNow.ToUnixTimeSeconds().ToString(CultureInfo.InvariantCulture);
 
@@ -298,7 +305,7 @@ public sealed class BilibiliApi
         var target = sign ? SignedUrl(url) : url;
         try
         {
-            using var response = await DefaultClient.GetAsync(target, cancellationToken);
+            using var response = await _client.GetAsync(target, cancellationToken);
             return await response.Content.ReadAsStringAsync(cancellationToken);
         }
         catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
@@ -326,7 +333,7 @@ public sealed class BilibiliApi
     {
         try
         {
-            using var response = await DefaultClient.GetAsync(url, cancellationToken);
+            using var response = await _client.GetAsync(url, cancellationToken);
             return await response.Content.ReadAsByteArrayAsync(cancellationToken);
         }
         catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
@@ -355,7 +362,7 @@ public sealed class BilibiliApi
         using var content = new FormUrlEncodedContent(parameters);
         try
         {
-            using var response = await DefaultClient.PostAsync(url, content, cancellationToken);
+            using var response = await _client.PostAsync(url, content, cancellationToken);
             var text = await response.Content.ReadAsStringAsync(cancellationToken);
             return JsonNode.Parse(text) as JsonObject;
         }
@@ -430,14 +437,14 @@ public sealed class BilibiliApi
         }
 
         var url = "https://api.bilibili.com/x/tv/playurl?" +
-                  string.Join("&", parameters.Select(p => $"{p.Key}={p.Value}"));
+                  string.Join("&", parameters.Select(p => $"{p.Key}={Uri.EscapeDataString(p.Value)}"));
 
         string text;
         try
         {
             text = await GetStringAsync(url, sign: true, cancellationToken);
         }
-        catch (Exception ex)
+        catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
         {
             Log.Error($"error getting video urls {ex.Message}");
             return null;
@@ -529,11 +536,15 @@ public sealed class BilibiliApi
             ["userDesireQn"] = request.DesireQn
         };
 
-        if (data["durl"] is JsonArray durl && durl.Count > 0 && durl[0] is JsonObject durlItem &&
-            durlItem["url"] is not null)
+        if (data["durl"] is JsonArray durl && durl.Count > 0)
         {
-            // todo: fix error when durl have more than one videos (same as python)
-            return new NvaPlayUrlResult(NvaJson.GetString(durlItem["url"]), qnDescription, currentQn);
+            var segments = durl.OfType<JsonObject>().Select(item => new MediaSegment(
+                NvaJson.GetString(item["url"]), NvaJson.GetDouble(item["length"]) / 1000)).ToArray();
+            if (segments.Length != durl.Count || segments.Any(s => s.Url.Length == 0) ||
+                (segments.Length > 1 && segments.Any(s => s.DurationSeconds <= 0)))
+                return null;
+            return new NvaPlayUrlResult(segments[0].Url, qnDescription, currentQn,
+                Segments: segments.Length > 1 ? segments : null);
         }
 
         if (data["dash"] is JsonObject dash && dash["video"] is JsonArray videos && videos.Count > 0)
@@ -551,14 +562,14 @@ public sealed class BilibiliApi
                 }
             }
 
-            var videoUrl = NvaJson.GetString(video?["base_url"]);
+            var videoUrl = NvaJson.GetString(video?["base_url"], NvaJson.GetString(video?["baseUrl"]));
             string? audioUrl = null;
             if (dash["audio"] is JsonArray audios && audios.Count > 0)
             {
                 var audio = audios.OfType<JsonObject>()
                     .OrderByDescending(a => NvaJson.GetInt(a["bandwidth"]))
                     .FirstOrDefault();
-                audioUrl = NvaJson.GetString(audio?["base_url"]);
+                audioUrl = NvaJson.GetString(audio?["base_url"], NvaJson.GetString(audio?["baseUrl"]));
             }
 
             if (videoUrl.Length > 0)
@@ -610,7 +621,7 @@ public sealed class BilibiliApi
         {
             text = await GetStringAsync(url, sign: false, cancellationToken);
         }
-        catch (Exception ex)
+        catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
         {
             Log.Error($"Error getting video info 2: {ex.Message}");
             return null;
@@ -668,7 +679,7 @@ public sealed class BilibiliApi
                 NvaJson.GetString(video["aid"]),
                 objectId,
                 episodeCid,
-                objectId,
+                epid != 0 ? objectId : "0",
                 titlePart,
                 portrait));
 
@@ -711,6 +722,7 @@ public sealed class BilibiliApi
         {
             var bytes = await GetBytesAsync(api, cancellationToken);
             var xml = Encoding.UTF8.GetString(bytes);
+            cancellationToken.ThrowIfCancellationRequested();
             if (!BuildAss(xml, api, filePath))
             {
                 return null;
@@ -718,7 +730,7 @@ public sealed class BilibiliApi
 
             return filePath;
         }
-        catch (Exception ex)
+        catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
         {
             Log.Error($"Error create sub file: {ex.Message}");
             return null;
@@ -803,7 +815,7 @@ public sealed class BilibiliApi
         foreach (var entry in ordered)
         {
             var data = entry.Fields;
-            if (!int.TryParse(data[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out var danmakuType) ||
+            if (data.Length < 8 || !int.TryParse(data[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out var danmakuType) ||
                 danmakuType >= 7)
             {
                 continue;
@@ -1010,9 +1022,9 @@ public sealed class BilibiliApi
         return new NvaTvLogin(
             NvaJson.GetString(data["auth_code"]),
             NvaJson.GetString(data["url"]),
-            NvaJson.GetString(data["access_token"]),
+            NvaJson.GetString(data["access_token"], NvaJson.GetString(data["token_info"]?["access_token"])),
             NvaJson.GetString(data["mid"]),
-            NvaJson.GetInt(data["expires_in"]));
+            NvaJson.GetInt(data["expires_in"], NvaJson.GetInt(data["token_info"]?["expires_in"])));
     }
 
     /// <summary>Signs a form body exactly like the app: sorted params + appsec md5.</summary>
@@ -1060,7 +1072,7 @@ public sealed class BilibiliApi
 
             return NvaJson.GetInt(data["vip_status"], NvaJson.GetInt(data["status"]));
         }
-        catch (Exception ex)
+        catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
         {
             Log.Warn($"GetAccountInfo failed: {ex.Message}");
             return 0;
@@ -1081,7 +1093,8 @@ public sealed class BilibiliApi
         foreach (var pair in url[(queryIndex + 1)..].Split('&', StringSplitOptions.RemoveEmptyEntries))
         {
             var equals = pair.IndexOf('=');
-            if (equals <= 0 || !pair[..equals].Equals("nva_ext", StringComparison.OrdinalIgnoreCase))
+            if (equals <= 0 || !(pair[..equals].Equals("nva_ext", StringComparison.OrdinalIgnoreCase) ||
+                                pair[..equals].Equals("_nva_ext_", StringComparison.OrdinalIgnoreCase)))
             {
                 continue;
             }

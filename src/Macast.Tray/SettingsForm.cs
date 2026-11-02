@@ -11,7 +11,7 @@ namespace Macast.Tray;
 /// <summary>
 /// The desktop replacement for the old Vue settings page. Everything that used to
 /// be a POST to /api is a normal WinForms control here, and applying the changes
-/// calls MacastApp.RestartAsync / ReloadRenderer directly instead of reloading a
+/// calls MacastApp.RestartAsync / ReloadRendererAsync directly instead of reloading a
 /// browser tab.
 /// </summary>
 internal sealed class SettingsForm : Form
@@ -44,11 +44,18 @@ internal sealed class SettingsForm : Form
     private int _sourcePort;
     private string[] _sourceBlocked = Array.Empty<string>();
     private string[] _sourceAdditional = Array.Empty<string>();
+    private readonly AppSettings _pluginDraft = new();
+    private string _sourcePlayerSettings = string.Empty;
+    private string _sourceProtocolSettings = string.Empty;
+    private int _sourceVolume;
+    private bool _sourceAutoStart;
     private bool _busy;
 
     public SettingsForm(MacastApp app)
     {
         _app = app;
+        foreach (var pair in app.Settings.Values)
+            _pluginDraft.Set(pair.Key, pair.Value);
         BuildUi();
         LoadSettings();
     }
@@ -114,7 +121,8 @@ internal sealed class SettingsForm : Form
         AddRow(layout, "设备名", _nameBox, "DLNA 中显示的设备名称，留空则使用 Macast(计算机名)。");
         AddRow(layout, "HTTP 端口", _portBox, "0 表示自动选择可用端口；修改后需要重启投屏服务。");
         AddRow(layout, "投屏协议", _protocolBox, "NVA 会让本机同时以“云视听小电视”的身份出现在 B 站客户端里。");
-        AddRow(layout, "开机自启", _autoStartBox, "写入 HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run。");
+        AddRow(layout, "开机自启", _autoStartBox,
+            "写入 HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run；程序目录变动后重新勾选一次即可刷新路径。");
 
         var configRow = new TableLayoutPanel { ColumnCount = 2, Dock = DockStyle.Fill, AutoSize = true };
         configRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 70));
@@ -294,32 +302,6 @@ internal sealed class SettingsForm : Form
             Margin = new Padding(0, 0, 0, 12)
         });
 
-        var plugins = string.Join("、", PluginRegistry.RendererPlugins.Select(p => p.Metadata.Title)
-            .Concat(PluginRegistry.ProtocolPlugins.Select(p => p.Metadata.Title)));
-        layout.Controls.Add(new Label
-        {
-            Text = "许可证：GPL-3.0（与上游一致）\r\n" +
-                   "插件：" + plugins,
-            AutoSize = true,
-            MaximumSize = new Size(width, 0),
-            Margin = new Padding(0, 0, 0, 12)
-        });
-
-        layout.Controls.Add(new Label
-        {
-            Text = "mpv：" + DescribeMpv(),
-            AutoSize = true,
-            MaximumSize = new Size(width, 0),
-            Margin = new Padding(0, 0, 0, 12)
-        });
-
-        layout.Controls.Add(new Label
-        {
-            Text = "配置文件：" + AppSettings.SettingPath,
-            AutoSize = true,
-            MaximumSize = new Size(width, 0)
-        });
-
         page.Controls.Add(layout);
         return page;
     }
@@ -381,6 +363,7 @@ internal sealed class SettingsForm : Form
         _portBox.Value = Math.Clamp(settings.GetInt("ApplicationPort", 0), 0, 65535);
 
         _autoStartBox.Checked = AutoStart.IsEnabled();
+        _sourceAutoStart = _autoStartBox.Checked;
 
         _rendererBox.Items.Clear();
         _protocolBox.Items.Clear();
@@ -419,7 +402,7 @@ internal sealed class SettingsForm : Form
             _additionalList.Items.Add(nic, additional.Contains(nic.Name, StringComparer.OrdinalIgnoreCase));
         }
 
-        _sourceName = settings.FriendlyName;
+        _sourceName = _nameBox.Text.Trim();
         _sourcePort = settings.GetInt("ApplicationPort", 0);
         _sourceRenderer = SelectedPluginId(_rendererBox);
         _sourceProtocol = SelectedPluginId(_protocolBox);
@@ -431,6 +414,9 @@ internal sealed class SettingsForm : Form
             _pluginList.SelectedIndex = 0;
         }
 
+        _sourcePlayerSettings = PlayerSettingsFingerprint();
+        _sourceProtocolSettings = PluginSettingsFingerprint(PluginRegistry.ProtocolPlugins.Select(p => p.Metadata));
+        _sourceVolume = (int)_volumeBox.Value;
         UpdateStatusText();
     }
 
@@ -592,7 +578,7 @@ internal sealed class SettingsForm : Form
 
     private Control CreateEditor(PluginSettingDescriptor descriptor)
     {
-        var settings = _app.Settings;
+        var settings = _pluginDraft;
         switch (descriptor.Kind)
         {
             case PluginSettingKind.Boolean:
@@ -700,38 +686,56 @@ internal sealed class SettingsForm : Form
             switch (editor)
             {
                 case CheckBox check:
-                    _app.Settings.Set(descriptor.Key, check.Checked);
+                    _pluginDraft.Set(descriptor.Key, check.Checked);
                     break;
                 case NumericUpDown number:
-                    _app.Settings.Set(descriptor.Key, (int)number.Value);
+                    _pluginDraft.Set(descriptor.Key, (int)number.Value);
                     break;
                 case ComboBox combo when combo.SelectedItem is PluginSettingChoice choice:
-                    _app.Settings.Set(descriptor.Key, choice.Value);
+                    _pluginDraft.Set(descriptor.Key, choice.Value);
                     break;
                 case TextBox text:
-                    _app.Settings.Set(descriptor.Key, text.Text.Trim());
+                    _pluginDraft.Set(descriptor.Key, text.Text.Trim());
                     break;
                 case TableLayoutPanel pathHost when pathHost.Tag is TextBox pathBox:
-                    _app.Settings.Set(descriptor.Key, pathBox.Text.Trim());
+                    _pluginDraft.Set(descriptor.Key, pathBox.Text.Trim());
                     break;
                 case TableLayoutPanel choiceHost when choiceHost.Tag is ComboBox choiceBox &&
                                                         choiceBox.SelectedItem is PluginSettingChoice picked:
-                    _app.Settings.Set(descriptor.Key, picked.Value);
+                    _pluginDraft.Set(descriptor.Key, picked.Value);
                     break;
             }
         }
     }
 
+    private string PluginSettingsFingerprint(IEnumerable<MacastPlugin> plugins) =>
+        string.Join("\n", plugins.SelectMany(p => p.Settings).Select(d => d.Kind switch
+        {
+            PluginSettingKind.Boolean => _pluginDraft.GetBool(d.Key, d.DefaultValue is bool b && b).ToString(),
+            PluginSettingKind.Number => _pluginDraft.GetInt(d.Key, d.DefaultValue is int i ? i : 0).ToString(),
+            _ => _pluginDraft.GetString(d.Key, d.DefaultValue?.ToString() ?? string.Empty)
+        }));
+
+    private string PlayerSettingsFingerprint() => string.Join("|",
+        ComboValue(_positionBox, 2), ComboValue(_sizeBox, 1), ComboValue(_hwBox, 1), _ontopBox.Checked,
+        PluginSettingsFingerprint(PluginRegistry.RendererPlugins.Select(p => p.Metadata)));
+
     private bool CollectSettings()
     {
-        CommitPluginEditors();
         var settings = _app.Settings;
-        var restartNeeded = false;
+        var restartNeeded = _sourceProtocolSettings !=
+            PluginSettingsFingerprint(PluginRegistry.ProtocolPlugins.Select(p => p.Metadata));
+        foreach (var descriptor in PluginRegistry.RendererPlugins.Select(p => p.Metadata)
+                     .Concat(PluginRegistry.ProtocolPlugins.Select(p => p.Metadata)).SelectMany(p => p.Settings))
+        {
+            if (_pluginDraft.Values.TryGetValue(descriptor.Key, out var value))
+                settings.Set(descriptor.Key, value);
+        }
 
         var name = _nameBox.Text.Trim();
-        if (name.Length > 0)
+        if (name != _sourceName)
         {
-            settings.Set("DLNA_FriendlyName", name);
+            settings.Set("DLNA_FriendlyName", name.Length > 0 ? name : settings.MachineFriendlyName);
             // A name the user typed wins over the "Macast(1234)" placeholder that
             // StartAsync generates when the configured port was already taken.
             settings.TempFriendlyName = null;
@@ -795,8 +799,10 @@ internal sealed class SettingsForm : Form
         SetBusy(true);
         try
         {
+            CommitPluginEditors();
             var restartNeeded = CollectSettings();
-            AutoStart.Set(_autoStartBox.Checked);
+            var autoStartOk = _autoStartBox.Checked == _sourceAutoStart || AutoStart.Set(_autoStartBox.Checked);
+            if (autoStartOk) _sourceAutoStart = _autoStartBox.Checked;
 
             if (restartNeeded)
             {
@@ -806,13 +812,27 @@ internal sealed class SettingsForm : Form
                     ? $"已应用：{_app.Settings.FriendlyName} @ {_app.DeviceUrl()}"
                     : "已应用配置；投屏服务当前处于停止状态。";
             }
-            else
+            else if (_sourcePlayerSettings != PlayerSettingsFingerprint())
             {
-                _app.ReloadRenderer();
+                await _app.ReloadRendererAsync();
                 _statusLabel.Text = "已应用播放器设置。";
             }
+            else
+            {
+                if (_sourceVolume != (int)_volumeBox.Value && _app.Running)
+                    _app.Renderer.SetMediaVolume((int)_volumeBox.Value);
+                _statusLabel.Text = "设置已保存，播放未中断。";
+            }
 
-            _sourceName = _app.Settings.FriendlyName;
+            if (!autoStartOk)
+            {
+                _statusLabel.Text = "设置已保存，但开机自启写入失败（详见日志）。";
+            }
+
+            _sourcePlayerSettings = PlayerSettingsFingerprint();
+            _sourceProtocolSettings = PluginSettingsFingerprint(PluginRegistry.ProtocolPlugins.Select(p => p.Metadata));
+            _sourceVolume = (int)_volumeBox.Value;
+            _sourceName = _nameBox.Text.Trim();
             _sourcePort = _app.Settings.GetInt("ApplicationPort", 0);
             _sourceRenderer = SelectedPluginId(_rendererBox);
             _sourceProtocol = SelectedPluginId(_protocolBox);
@@ -940,30 +960,6 @@ internal sealed class SettingsForm : Form
         {
             Log.Error($"open folder failed: {ex.Message}");
         }
-    }
-
-    private static string DescribeMpv()
-    {
-        var exe = Path.Combine(AppContext.BaseDirectory, "bin", OperatingSystem.IsWindows() ? "mpv.exe" : "mpv");
-        if (!File.Exists(exe))
-        {
-            return "未找到内置 mpv（可使用系统 PATH 中的 mpv）";
-        }
-
-        var versionFile = Path.Combine(AppContext.BaseDirectory, "bin", "mpv-version.txt");
-        if (File.Exists(versionFile))
-        {
-            try
-            {
-                return File.ReadAllText(versionFile).Trim();
-            }
-            catch
-            {
-                // fall through
-            }
-        }
-
-        return exe;
     }
 
     private static IEnumerable<NicItem> EnumerateInterfaces()

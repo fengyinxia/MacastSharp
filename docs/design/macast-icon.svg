@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">Macast · 投屏</title>
+  <desc id="desc">深墨蓝圆角底座，薄荷绿屏幕与无线投屏信号，中央为白色播放标记。</desc>
+  <defs>
+    <linearGradient id="base" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#203444"/>
+      <stop offset="1" stop-color="#101C27"/>
+    </linearGradient>
+    <linearGradient id="signal" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#A9F5D4"/>
+      <stop offset="1" stop-color="#56DBB1"/>
+    </linearGradient>
+  </defs>
+  <rect x="16" y="16" width="480" height="480" rx="112" fill="url(#base)"/>
+  <rect x="17" y="17" width="478" height="478" rx="111" fill="none" stroke="#FFFFFF" stroke-opacity=".08" stroke-width="2"/>
+  <path d="M112 222V170Q112 142 140 142H372Q400 142 400 170V316Q400 344 372 344H282" fill="none" stroke="url(#signal)" stroke-width="26" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M250 208Q250 198 259 203L312 235Q321 241 312 247L259 279Q250 284 250 274Z" fill="#F4FBF8"/>
+  <g fill="none" stroke="url(#signal)" stroke-width="25" stroke-linecap="round">
+    <path d="M112 266A98 98 0 0 1 210 364"/>
+    <path d="M112 315A49 49 0 0 1 161 364"/>
+  </g>
+  <circle cx="112" cy="364" r="15" fill="#A9F5D4"/>
+</svg>

@@ -2,7 +2,7 @@ namespace Macast.Core.Renderer;
 
 /// <summary>
 /// A renderer that can attach a second, audio-only stream. Bilibili DASH splits
-/// video and audio into two URLs; mpv can mux them with "audio-add".
+/// video and audio into two URLs, which must be opened together by the renderer.
 /// </summary>
 public interface IAudioTrackRenderer
 {
@@ -10,7 +10,14 @@ public interface IAudioTrackRenderer
     void SetMediaUrlWithAudio(string url, string start, string audioUrl);
 }
 
-public interface IRenderer
+public sealed record MediaSegment(string Url, double DurationSeconds);
+
+public interface ISegmentedRenderer
+{
+    void SetMediaSegments(IReadOnlyList<MediaSegment> segments, string start);
+}
+
+public interface IRenderer : IDisposable
 {
     string Name { get; }
     bool Available { get; }

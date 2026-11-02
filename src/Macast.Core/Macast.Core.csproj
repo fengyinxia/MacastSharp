@@ -8,9 +8,6 @@
     <RootNamespace>Macast.Core</RootNamespace>
   </PropertyGroup>
   <ItemGroup>
-    <FrameworkReference Include="Microsoft.AspNetCore.App" />
-  </ItemGroup>
-  <ItemGroup>
     <!-- One wildcard for every asset (XML, csv, version.txt and icon.ico). The
          previous split item silently lost icon.ico in RID-specific publish. -->
     <Content Include="Assets/**/*">

@@ -9,7 +9,7 @@ namespace Macast.Core.Protocols;
 
 /// <summary>
 /// The stock DLNA implementation: <see cref="DlnaProtocol"/> keeps the state and
-/// answers SOAP, <see cref="MacastHttpServer"/> serves it over Kestrel.
+/// answers SOAP, <see cref="MacastHttpServer"/> serves it over the shared socket HTTP transport.
 /// </summary>
 public sealed class DlnaProtocolService : IProtocolService
 {
@@ -17,11 +17,11 @@ public sealed class DlnaProtocolService : IProtocolService
     private readonly MacastHttpServer _server;
     private string _description = string.Empty;
 
-    public DlnaProtocolService(AppSettings settings)
+    public DlnaProtocolService(AppSettings settings, bool loopbackOnly = false)
     {
         _settings = settings;
         Protocol = new DlnaProtocol(settings);
-        _server = new MacastHttpServer(settings, Protocol, () => _description);
+        _server = new MacastHttpServer(settings, Protocol, () => _description, loopbackOnly);
     }
 
     public DlnaProtocol Protocol { get; }
@@ -54,13 +54,14 @@ public sealed class DlnaProtocolService : IProtocolService
     public async Task StopAsync()
     {
         await _server.StopAsync();
-        Protocol.Stop();
+        await Protocol.StopAsync();
     }
 
     public async ValueTask DisposeAsync()
     {
         await StopAsync();
         await _server.DisposeAsync();
+        await Protocol.DisposeAsync();
     }
 
     public string GetState(string name) => Protocol.GetState(name);

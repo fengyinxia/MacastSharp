@@ -1,92 +1,76 @@
 <#
 .SYNOPSIS
-Publishes the portable Macast C# package into dist\MacastSharp-win-x64 and zips it.
-
-.DESCRIPTION
-Replaces the manual publish steps from the handoff document. bin\mpv.exe and the
-licence files are never deleted by publish, but they are verified before the zip
-is built so an incomplete package cannot be shipped silently.
-
-.EXAMPLE
-pwsh -File .\pack.ps1
-pwsh -File .\pack.ps1 -SkipZip
+Publishes the Windows x64 GUI only, without a player or bundled .NET runtime.
 #>
 [CmdletBinding()]
 param(
-    [switch]$SkipZip
+    [switch]$SkipZip,
+    [ValidatePattern('^[A-Za-z0-9_-]+$')]
+    [string]$PackageName = 'MacastSharp-gui-win-x64'
 )
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $MyInvocation.MyCommand.Definition
-$dist = Join-Path $root 'dist\MacastSharp-win-x64'
-$zip = Join-Path $root 'dist\MacastSharp-win-x64.zip'
+$name = $PackageName
+$dist = Join-Path $root "dist\$name"
+$zip = Join-Path $root "dist\$name.zip"
+$stage = Join-Path $root (".work\publish-" + [Guid]::NewGuid().ToString('N'))
 
-$publishArgs = @(
-    '-c', 'Release',
-    '-r', 'win-x64',
-    '--self-contained', 'true',
-    '-p:PublishSingleFile=true',
-    '-p:IncludeNativeLibrariesForSelfExtract=true',
-    '-p:EnableCompressionInSingleFile=true',
-    '-p:DebugType=None',
-    '-p:DebugSymbols=false',
-    '-o', $dist
-)
+try {
+    Write-Host '== publish GUI (framework-dependent, no player) ==' -ForegroundColor Cyan
+    dotnet publish (Join-Path $root 'src\Macast.Tray\Macast.Tray.csproj') `
+        -c Release -r win-x64 --self-contained false `
+        -p:SelfContained=false -p:PublishSelfContained=false -p:PublishSingleFile=true `
+        -p:IncludeNativeLibrariesForSelfExtract=false -p:EnableCompressionInSingleFile=false `
+        -p:DebugType=None -p:DebugSymbols=false -o $stage
+    if ($LASTEXITCODE -ne 0) { throw 'macast-gui publish failed' }
 
-New-Item -ItemType Directory -Force -Path $dist | Out-Null
-
-# Publish does not remove stale files, and the old Vue assets used to live in
-# Assets/assets. Keep bin\ (mpv + licences are curated by hand) and wipe the rest.
-Get-ChildItem -LiteralPath $dist -Force | Where-Object { $_.Name -ne 'bin' } |
-    Remove-Item -Recurse -Force
-
-Write-Host '== publish macast-cli ==' -ForegroundColor Cyan
-dotnet publish (Join-Path $root 'src\Macast.Cli\Macast.Cli.csproj') @publishArgs
-if ($LASTEXITCODE -ne 0) { throw 'macast-cli publish failed' }
-
-Write-Host '== publish macast-gui ==' -ForegroundColor Cyan
-dotnet publish (Join-Path $root 'src\Macast.Tray\Macast.Tray.csproj') @publishArgs
-if ($LASTEXITCODE -ne 0) { throw 'macast-gui publish failed' }
-
-# Safety net: publish has dropped Assets\icon.ico in some SDK/RID combinations,
-# so copy the whole asset tree explicitly after the two publishes.
-Copy-Item (Join-Path $root 'src\Macast.Core\Assets\*') (Join-Path $dist 'Assets') -Recurse -Force
-
-# Documentation and licence shipped next to the executables.
-# Prefer the licence inside this project, fall back to the parent repository layout.
-$license = Join-Path $root 'LICENSE'
-if (-not (Test-Path $license)) {
-    $license = Join-Path (Split-Path -Parent $root) 'LICENSE'
-}
-if (Test-Path $license) {
-    Copy-Item $license (Join-Path $dist 'LICENSE') -Force
-}
-Copy-Item (Join-Path $root 'README.md') (Join-Path $dist 'README.md') -Force
-
-$mpv = Join-Path $dist 'bin\mpv.exe'
-if (-not (Test-Path $mpv)) {
-    Write-Warning "bin\mpv.exe is missing from $dist - the package will not be able to play until it is copied in."
-}
-
-foreach ($required in @('macast-gui.exe', 'macast-cli.exe', 'Assets\icon.ico', 'Assets\xml\Description.xml', 'Assets\xml\AVTransport.xml')) {
-    if (-not (Test-Path (Join-Path $dist $required))) {
-        throw "package is incomplete: $required is missing"
+    $runtimeConfig = Get-Content (Join-Path $root 'src\Macast.Tray\bin\Release\net8.0-windows\win-x64\macast-gui.runtimeconfig.json') -Raw | ConvertFrom-Json
+    if ($runtimeConfig.runtimeOptions.includedFrameworks -or
+        $runtimeConfig.runtimeOptions.frameworks.name -contains 'Microsoft.AspNetCore.App') {
+        throw 'publish must depend on the installed Desktop Runtime, without bundled frameworks or ASP.NET Core'
     }
+
+    Copy-Item (Join-Path $root 'src\Macast.Core\Assets\*') (Join-Path $stage 'Assets') -Recurse -Force
+    Copy-Item (Join-Path $root 'LICENSE') (Join-Path $stage 'LICENSE')
+    Copy-Item (Join-Path $root 'README.md') (Join-Path $stage 'README.md')
+
+    foreach ($file in @('macast-gui.exe', 'LICENSE', 'Assets\icon.ico',
+        'Assets\xml\Description.xml', 'Assets\xml\AVTransport.xml',
+        'Assets\xml\RenderingControl.xml', 'Assets\xml\ConnectionManager.xml', 'Assets\xml\NirvanaControl.xml')) {
+        if (-not (Test-Path -LiteralPath (Join-Path $stage $file) -PathType Leaf)) {
+            throw "package is incomplete: $file"
+        }
+    }
+    if ((Test-Path (Join-Path $stage 'bin')) -or
+        (Test-Path (Join-Path $stage 'macast-cli.exe')) -or
+        (Test-Path (Join-Path $stage 'coreclr.dll'))) {
+        throw 'unexpected player, CLI or .NET runtime in GUI-only package'
+    }
+
+    $manifest = Join-Path $stage 'SHA256SUMS.txt'
+    Get-ChildItem $stage -Recurse -File | Sort-Object FullName | ForEach-Object {
+        "$((Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash)  $([IO.Path]::GetRelativePath($stage, $_.FullName))"
+    } | Set-Content $manifest -Encoding utf8
+
+    # Only replace the previous GUI release after publish and validation succeed.
+    if (Test-Path $dist) {
+        $probe = [IO.File]::Open((Join-Path $dist 'macast-gui.exe'), 'Open', 'ReadWrite', 'None')
+        $probe.Dispose()
+        Remove-Item $dist -Recurse -Force
+    }
+    New-Item -ItemType Directory -Force -Path (Split-Path $dist) | Out-Null
+    Move-Item $stage $dist
+
+    $size = (Get-ChildItem $dist -Recurse -File | Measure-Object Length -Sum).Sum
+    Write-Host ("dist: {0} ({1:N2} MiB)" -f $dist, ($size / 1MB)) -ForegroundColor Green
+    Write-Host '.NET 8 Desktop Runtime x64 and an external MPV/PotPlayer are required. ASP.NET Core is not required.'
+    if ($SkipZip) { return }
+
+    Compress-Archive -Path (Join-Path $dist '*') -DestinationPath $zip -Force
+    Write-Host ("zip: {0} ({1:N2} MiB)" -f $zip, ((Get-Item $zip).Length / 1MB)) -ForegroundColor Green
+    Write-Host ("sha256: {0}" -f (Get-FileHash $zip -Algorithm SHA256).Hash)
 }
-
-$size = (Get-ChildItem $dist -Recurse -File | Measure-Object -Property Length -Sum).Sum
-Write-Host ("dist size: {0:N1} MB" -f ($size / 1MB)) -ForegroundColor Green
-
-if ($SkipZip) {
-    Write-Host 'zip skipped (-SkipZip)' -ForegroundColor Yellow
-    return
+finally {
+    if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
 }
-
-if (Test-Path $zip) { Remove-Item $zip -Force }
-Compress-Archive -Path (Join-Path $dist '*') -DestinationPath $zip -Force
-
-$hash = (Get-FileHash $zip -Algorithm SHA256).Hash
-$zipSize = (Get-Item $zip).Length
-Write-Host ("zip: {0}" -f $zip) -ForegroundColor Green
-Write-Host ("zip size: {0:N1} MB" -f ($zipSize / 1MB))
-Write-Host ("sha256: {0}" -f $hash)

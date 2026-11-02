@@ -121,11 +121,18 @@ public sealed class NvaCasting : IAsyncDisposable
     public const int DefaultDesireQn = 80;
 
     private readonly INvaCastingHost _host;
+    internal NvaPlaybackState Playback { get; } = new();
+    internal SemaphoreSlim Commands { get; } = new(1, 1);
+    private CancellationTokenSource? _extraCts;
+    private Task _extraTask = Task.CompletedTask;
+    private Task _nextTask = Task.CompletedTask;
+    private CancellationTokenSource _backgroundCts = new();
     private readonly object _gate = new();
     private readonly List<NvaClient> _clients = new();
     private readonly CancellationTokenSource _cts = new();
     private readonly Channel<(string Command, JsonNode? Data)> _broadcasts =
-        Channel.CreateUnbounded<(string, JsonNode?)>(new UnboundedChannelOptions { SingleReader = true });
+        Channel.CreateBounded<(string, JsonNode?)>(new BoundedChannelOptions(256)
+        { SingleReader = true, FullMode = BoundedChannelFullMode.DropOldest });
 
     private Task? _pump;
     private bool _started;
@@ -189,9 +196,7 @@ public sealed class NvaCasting : IAsyncDisposable
         try
         {
             if (!string.Equals(method, "SETUP", StringComparison.Ordinal))
-            {
-                await RestoreAsync();
-            }
+                await client.UpdatePlayStateAsync(cancellationToken);
 
             await ReadLoopAsync(client, stream, cancellationToken);
         }
@@ -217,8 +222,7 @@ public sealed class NvaCasting : IAsyncDisposable
 
             if (sameSession is not null)
             {
-                // 设备断线重连：恢复之前的 session，把新 socket 接到旧的 handler 上，
-                // 播放状态（标题/清晰度/分集）全部保留。
+                // Replace a duplicate live socket; playback lives in the manager.
                 Log.Info("NVA: 设备断线重连，恢复之前的 session");
                 client = sameSession;
                 reused = true;
@@ -227,23 +231,8 @@ public sealed class NvaCasting : IAsyncDisposable
             {
                 client = new NvaClient(this, session, uuid);
 
-                // The bilibili app is known to hold two sockets for one device (the
-                // cast panel and the background service use different sessions).
-                // Terminating the other one makes the phone reconnect in a tight
-                // loop, so both stay alive; the newcomer inherits the play state.
-                var previous = _clients
-                    .Where(c => string.Equals(c.Uuid, uuid, StringComparison.Ordinal))
-                    .OrderByDescending(c => c.ConnectionId)
-                    .FirstOrDefault();
-                if (previous is not null)
-                {
-                    Log.Info("NVA: 同一设备的并行连接，保留旧连接并继承播放状态");
-                    client.CopyPlaybackFrom(previous);
-                }
-                else
-                {
-                    Log.Info("NVA: 新设备连接");
-                }
+                // Both phone sockets share the same playback, including after a disconnect.
+                Log.Info("NVA: control connection attached");
 
                 _clients.Add(client);
             }
@@ -255,26 +244,6 @@ public sealed class NvaCasting : IAsyncDisposable
         return (client, reused);
     }
 
-    private async Task RestoreAsync()
-    {
-        foreach (var client in Snapshot())
-        {
-            if (client.Terminated)
-            {
-                continue;
-            }
-
-            try
-            {
-                await client.UpdatePlayStateAsync(_cts.Token);
-            }
-            catch (Exception ex)
-            {
-                Log.Warn($"NVA restore failed: {ex.Message}");
-            }
-        }
-    }
-
     private static async Task ReadLoopAsync(NvaClient client, Stream stream, CancellationToken cancellationToken)
     {
         var buffer = new byte[2048];
@@ -283,7 +252,9 @@ public sealed class NvaCasting : IAsyncDisposable
             int read;
             try
             {
-                read = await stream.ReadAsync(buffer.AsMemory(0, buffer.Length), cancellationToken);
+                using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                timeout.CancelAfter(TimeSpan.FromSeconds(30));
+                read = await stream.ReadAsync(buffer.AsMemory(0, buffer.Length), timeout.Token);
             }
             catch (Exception ex) when (ex is IOException or ObjectDisposedException or OperationCanceledException)
             {
@@ -324,7 +295,35 @@ public sealed class NvaCasting : IAsyncDisposable
 
     // ---- broadcasting --------------------------------------------------
 
-    /// <summary>Drops every connected device without tearing the manager down (protocol stop).</summary>
+    internal async Task CancelExtraInfoAsync()
+    {
+        _extraCts?.Cancel();
+        await _extraTask;
+        _extraCts?.Dispose();
+        _extraCts = null;
+        _extraTask = Task.CompletedTask;
+    }
+
+    internal async Task StartExtraInfoAsync(Func<CancellationToken, Task> work)
+    {
+        await CancelExtraInfoAsync();
+        _extraCts = CancellationTokenSource.CreateLinkedTokenSource(_backgroundCts.Token, _cts.Token);
+        var token = _extraCts.Token;
+        _extraTask = Task.Run(() => work(token), CancellationToken.None);
+    }
+
+    public async Task StopBackgroundAsync()
+    {
+        _backgroundCts.Cancel();
+        await _nextTask;
+        await CancelExtraInfoAsync();
+        _backgroundCts.Dispose();
+        _backgroundCts = new CancellationTokenSource();
+        _playList.Clear();
+        _mediaPlaying = false;
+        _lastPosition = _lastDuration = string.Empty;
+    }
+
     public void DisconnectAll()
     {
         foreach (var client in Snapshot())
@@ -439,10 +438,12 @@ public sealed class NvaCasting : IAsyncDisposable
                 break;
 
             case "TransportPlaySpeed":
+                Playback.Speed = ParseDouble(value, 1);
                 BroadcastAsync("SpeedChanged", SpeedPayload(ParseDouble(value, 1)));
                 break;
 
             case "DisplayCurrentSubtitle":
+                Playback.DanmakuOpen = NvaJson.ParseBool(value, true);
                 BroadcastAsync("OnDanmakuSwitch", new JsonObject { ["open"] = NvaJson.ParseBool(value, true) });
                 break;
 
@@ -481,7 +482,11 @@ public sealed class NvaCasting : IAsyncDisposable
 
             case "NO_MEDIA_PRESENT":
                 BroadcastAsync("OnPlayState", new JsonObject { ["playState"] = 6 });
-                _ = Task.Run(PlayNextEpisodeAsync, CancellationToken.None);
+                if (_nextTask.IsCompleted && !_backgroundCts.IsCancellationRequested)
+                {
+                    var token = _backgroundCts.Token;
+                    _nextTask = Task.Run(() => PlayNextEpisodeAsync(token), CancellationToken.None);
+                }
                 break;
         }
 
@@ -511,10 +516,16 @@ public sealed class NvaCasting : IAsyncDisposable
         Log.Info($"NVA play list updated: {_playList.Count} item(s), index {_playIndex}");
     }
 
-    private async Task PlayNextEpisodeAsync()
+    private async Task PlayNextEpisodeAsync(CancellationToken cancellationToken)
     {
         try
         {
+            await Commands.WaitAsync(cancellationToken);
+        }
+        catch (OperationCanceledException) { return; }
+        try
+        {
+            await CancelExtraInfoAsync();
             _playIndex++;
             if (_playIndex < _playList.Count)
             {
@@ -528,27 +539,28 @@ public sealed class NvaCasting : IAsyncDisposable
                 }
 
                 client.ApplyPlayItem(next);
-                var resolved = await client.ResolvePlayUrlAsync(_cts.Token);
+                var resolved = await client.ResolvePlayUrlAsync(cancellationToken);
                 if (resolved is null)
                 {
                     Log.Warn("NVA auto play: get_video_url returned no url");
                     return;
                 }
 
-                await client.SendPlayCmdAsync(resolved.Url!, "0", _cts.Token, resolved.AudioUrl);
+                await client.SendPlayCmdAsync(resolved.Url!, "0", cancellationToken, resolved.AudioUrl, resolved.Segments);
             }
             else
             {
                 Log.Info($"分集{_playIndex} 没有下一集，播放结束");
             }
         }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { }
         catch (Exception ex)
         {
             Log.Warn($"NVA auto play next episode failed: {ex.Message}");
         }
         finally
         {
-            _mediaPlaying = false;
+            Commands.Release();
         }
     }
 
@@ -563,19 +575,21 @@ public sealed class NvaCasting : IAsyncDisposable
             return false;
         }
 
-        return await client.SwitchQualityAsync(qn, cancellationToken);
+        await Commands.WaitAsync(cancellationToken);
+        try { return await client.SwitchQualityAsync(qn, cancellationToken); }
+        finally { Commands.Release(); }
     }
 
     public JsonObject DescribeActivePlay()
     {
         var client = Snapshot().FirstOrDefault(c => !c.Terminated);
-        return client?.DescribePlay() ?? new JsonObject();
+        return (client ?? new NvaClient(this, string.Empty, string.Empty)).DescribePlay();
     }
 
     public JsonObject DescribeActivePlayTotal()
     {
         var client = Snapshot().FirstOrDefault(c => !c.Terminated);
-        return client?.DescribePlayInfoTotal() ?? new JsonObject();
+        return (client ?? new NvaClient(this, string.Empty, string.Empty)).DescribePlayInfoTotal();
     }
 
     public static int PositionToSecond(string? position)
@@ -604,6 +618,8 @@ public sealed class NvaCasting : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
+        await StopBackgroundAsync();
+        _backgroundCts.Dispose();
         _broadcasts.Writer.TryComplete();
         try
         {
@@ -641,15 +657,18 @@ public sealed class NvaCasting : IAsyncDisposable
 }
 
 /// <summary>
-/// One casting device (nirvana.py NVAConectionHandler). It owns the play state, decodes the
+/// One control connection (nirvana.py NVAConectionHandler). It shares playback state and decodes the
 /// frames that arrive on its socket and answers commands.
 /// </summary>
 public sealed class NvaClient
 {
     private readonly NvaCasting _manager;
     private readonly SemaphoreSlim _sendLock = new(1, 1);
-    private readonly List<byte> _cache = new();
-    private readonly object _stateGate = new();
+    private const int MaxFrameSize = 1024 * 1024;
+    private readonly object _cacheGate = new();
+    private byte[] _cache = new byte[4096];
+    private int _cacheCount;
+    private object _stateGate => _manager.Playback.Gate;
 
     private Stream? _stream;
     private int _counter;
@@ -657,57 +676,29 @@ public sealed class NvaClient
     private volatile bool _terminated = true;
     private CancellationTokenSource? _pingCts;
 
-    private string _aid = string.Empty;
-    private string _oid = string.Empty;
-    private string _cid = string.Empty;
-    private string _roomId = "0";
-    private string _accessKey = string.Empty;
-    private string _title = string.Empty;
-    private string _titleP = string.Empty;
-    private int _epid;
-    private int _seasonId;
-    private int _currentQn;
-    private int _desireQn;
-    private int _playUrlType = 1;
-    private int _contentType = 1;
-    private bool _isPortrait;
-    private bool _danmakuSwitchSave = true;
-    private double _desireSpeed = 1;
-    private JsonObject _qn = new();
+    private ref string _aid => ref _manager.Playback.Aid;
+    private ref string _oid => ref _manager.Playback.Oid;
+    private ref string _cid => ref _manager.Playback.Cid;
+    private ref string _roomId => ref _manager.Playback.RoomId;
+    private ref string _accessKey => ref _manager.Playback.AccessKey;
+    private ref string _title => ref _manager.Playback.Title;
+    private ref string _titleP => ref _manager.Playback.EpisodeTitle;
+    private ref int _epid => ref _manager.Playback.Epid;
+    private ref int _seasonId => ref _manager.Playback.SeasonId;
+    private ref int _currentQn => ref _manager.Playback.CurrentQn;
+    private ref int _desireQn => ref _manager.Playback.DesireQn;
+    private ref int _playUrlType => ref _manager.Playback.PlayUrlType;
+    private ref int _contentType => ref _manager.Playback.ContentType;
+    private ref bool _isPortrait => ref _manager.Playback.IsPortrait;
+    private ref bool _danmakuSwitchSave => ref _manager.Playback.DanmakuOpen;
+    private ref double _desireSpeed => ref _manager.Playback.Speed;
+    private ref JsonObject _qn => ref _manager.Playback.Qn;
 
     public NvaClient(NvaCasting manager, string session, string uuid)
     {
         _manager = manager;
         Session = session;
         Uuid = uuid;
-    }
-
-    /// <summary>
-    /// A second socket of the same device starts without any play state; inherit it
-    /// so the phone's quality menu / play info keep working over either connection.
-    /// </summary>
-    internal void CopyPlaybackFrom(NvaClient other)
-    {
-        lock (other._stateGate)
-        {
-            _aid = other._aid;
-            _oid = other._oid;
-            _cid = other._cid;
-            _roomId = other._roomId;
-            _accessKey = other._accessKey;
-            _title = other._title;
-            _titleP = other._titleP;
-            _epid = other._epid;
-            _seasonId = other._seasonId;
-            _currentQn = other._currentQn;
-            _desireQn = other._desireQn;
-            _playUrlType = other._playUrlType;
-            _contentType = other._contentType;
-            _isPortrait = other._isPortrait;
-            _danmakuSwitchSave = other._danmakuSwitchSave;
-            _desireSpeed = other._desireSpeed;
-            _qn = (JsonObject)other._qn.DeepClone();
-        }
     }
 
     public string Session { get; }
@@ -731,9 +722,10 @@ public sealed class NvaClient
         Volatile.Write(ref _connectionId, connectionId);
         _terminated = false;
         Interlocked.Exchange(ref _counter, 0);
-        lock (_cache)
+        lock (_cacheGate)
         {
-            _cache.Clear();
+            _cache = new byte[4096];
+            _cacheCount = 0;
         }
 
         if (previous is not null)
@@ -804,7 +796,7 @@ public sealed class NvaClient
 
                 var counter = Interlocked.Increment(ref _counter);
                 await WriteAsync(NvaFrame.Ping(unchecked((uint)counter)), cancellationToken);
-                Log.Info($"NVA_PING_THREAD send ping {counter}");
+                Log.Debug($"NVA ping {counter}");
             }
         }
         catch (OperationCanceledException)
@@ -838,8 +830,10 @@ public sealed class NvaClient
 
         try
         {
-            await stream.WriteAsync(data, cancellationToken);
-            await stream.FlushAsync(cancellationToken);
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeout.CancelAfter(TimeSpan.FromSeconds(5));
+            await stream.WriteAsync(data, timeout.Token);
+            await stream.FlushAsync(timeout.Token);
         }
         catch (Exception ex) when (ex is IOException or ObjectDisposedException or OperationCanceledException)
         {
@@ -860,14 +854,14 @@ public sealed class NvaClient
     {
         var counter = Interlocked.Increment(ref _counter);
         var json = data?.ToJsonString();
-        Log.Info($"SEND_CMD{counter} cmd:{command} data:{json}");
+        Log.Debug($"SEND_CMD{counter} cmd:{command}");
         await WriteAsync(NvaFrame.Command(unchecked((uint)counter), command, json), cancellationToken);
     }
 
     public async Task SendResponseAsync(int counter, JsonNode? data, CancellationToken cancellationToken = default)
     {
         var json = data?.ToJsonString();
-        Log.Info($"SEND_RES{counter} data:{json}");
+        Log.Debug($"SEND_RES{counter}");
         await WriteAsync(NvaFrame.Response(unchecked((uint)counter), json), cancellationToken);
     }
 
@@ -876,16 +870,24 @@ public sealed class NvaClient
     public async Task ParseAsync(ReadOnlyMemory<byte> data, CancellationToken cancellationToken)
     {
         byte[] buffer;
-        lock (_cache)
+        int bufferLength;
+        lock (_cacheGate)
         {
-            _cache.AddRange(data.ToArray());
-            buffer = _cache.ToArray();
+            var required = _cacheCount + data.Length;
+            if (required > MaxFrameSize + 2048)
+                throw new InvalidDataException("NVA frame buffer too large");
+            if (required > _cache.Length)
+                Array.Resize(ref _cache, Math.Max(required, _cache.Length * 2));
+            data.CopyTo(_cache.AsMemory(_cacheCount));
+            _cacheCount = required;
+            buffer = _cache;
+            bufferLength = _cacheCount;
         }
 
         var index = 0;
-        while (index < buffer.Length)
+        while (index < bufferLength)
         {
-            if (buffer.Length - index < 6)
+            if (bufferLength - index < 6)
             {
                 break;
             }
@@ -903,7 +905,7 @@ public sealed class NvaClient
 
             if (kind == NvaFrame.SendCmd)
             {
-                if (buffer.Length - index - 6 < 10)
+                if (bufferLength - index - 6 < 10)
                 {
                     break;
                 }
@@ -921,7 +923,7 @@ public sealed class NvaClient
 
                 if (allLength == 2)
                 {
-                    if (buffer.Length - index - 16 < methodLength)
+                    if (bufferLength - index - 16 < methodLength)
                     {
                         break;
                     }
@@ -932,7 +934,7 @@ public sealed class NvaClient
                 }
                 else if (allLength == 3)
                 {
-                    if (buffer.Length - index - 16 < methodLength + 4)
+                    if (bufferLength - index - 16 < methodLength + 4)
                     {
                         break;
                     }
@@ -940,7 +942,9 @@ public sealed class NvaClient
                     var method = Encoding.UTF8.GetString(buffer, index + 16, methodLength);
                     var paramLength =
                         BinaryPrimitives.ReadInt32BigEndian(buffer.AsSpan(index + 16 + methodLength, 4));
-                    if (paramLength < 0 || buffer.Length - index - 20 - methodLength < paramLength)
+                    if (paramLength < 0 || paramLength > MaxFrameSize - 20 - methodLength)
+                        throw new InvalidDataException("invalid NVA frame length");
+                    if (bufferLength - index - 20 - methodLength < paramLength)
                     {
                         break;
                     }
@@ -960,24 +964,25 @@ public sealed class NvaClient
             {
                 if (allLength == 0)
                 {
-                    Log.Info($"RET{counter} params:<none>");
+                    Log.Debug($"RET{counter}");
                     index += 6;
                 }
                 else if (allLength == 1)
                 {
-                    if (buffer.Length - index - 6 < 4)
+                    if (bufferLength - index - 6 < 4)
                     {
                         break;
                     }
 
                     var paramLength = BinaryPrimitives.ReadInt32BigEndian(buffer.AsSpan(index + 6, 4));
-                    if (paramLength < 0 || buffer.Length - index - 10 < paramLength)
+                    if (paramLength < 0 || paramLength > MaxFrameSize - 10)
+                        throw new InvalidDataException("invalid NVA frame length");
+                    if (bufferLength - index - 10 < paramLength)
                     {
                         break;
                     }
 
-                    var json = Encoding.UTF8.GetString(buffer, index + 10, paramLength);
-                    Log.Info($"RET{counter} params:{json}");
+                    Log.Debug($"RET{counter}");
                     index += 10 + paramLength;
                 }
                 else
@@ -988,11 +993,12 @@ public sealed class NvaClient
             }
         }
 
-        lock (_cache)
+        lock (_cacheGate)
         {
-            if (index > 0)
+            if (ReferenceEquals(buffer, _cache) && index > 0)
             {
-                _cache.RemoveRange(0, Math.Min(index, _cache.Count));
+                _cacheCount -= index;
+                Buffer.BlockCopy(buffer, index, _cache, 0, _cacheCount);
             }
         }
     }
@@ -1015,7 +1021,15 @@ public sealed class NvaClient
     public async Task HandleCommandAsync(string method, int counter, JsonNode? parameters,
         CancellationToken cancellationToken)
     {
-        Log.Info($"CMD{counter} method:{method} params:{parameters?.ToJsonString()}");
+        await _manager.Commands.WaitAsync(cancellationToken);
+        try { await HandleCommandCoreAsync(method, counter, parameters, cancellationToken); }
+        finally { _manager.Commands.Release(); }
+    }
+
+    private async Task HandleCommandCoreAsync(string method, int counter, JsonNode? parameters,
+        CancellationToken cancellationToken)
+    {
+        Log.Info($"CMD{counter} method:{method}");
         var renderer = Host.Renderer;
 
         switch (method)
@@ -1068,6 +1082,8 @@ public sealed class NvaClient
             case "SwitchSpeed":
             {
                 var speed = NvaJson.GetDouble(parameters?["speed"], 1);
+                if (!NvaCasting.SupportSpeeds.Contains(speed)) break;
+                _desireSpeed = speed;
                 renderer?.SetMediaSpeed(speed);
                 renderer?.SetMediaText($"修改倍速：{NvaCasting.FormatSpeed(speed)}X", 2000);
                 break;
@@ -1080,6 +1096,7 @@ public sealed class NvaClient
 
             case "Stop":
                 await SendResponseAsync(counter, null, cancellationToken);
+                await _manager.CancelExtraInfoAsync();
                 renderer?.SetMediaStop();
                 break;
 
@@ -1120,6 +1137,9 @@ public sealed class NvaClient
             return;
         }
 
+        await _manager.CancelExtraInfoAsync();
+        _manager.SetPlayList(Array.Empty<NvaPlayItem>(), 0);
+        _titleP = string.Empty;
         _aid = aid;
         _oid = NvaJson.GetString(parameters?["oid"], _aid);
         _cid = NvaJson.GetString(parameters?["cid"]);
@@ -1156,7 +1176,7 @@ public sealed class NvaClient
         }
 
         await SendPlayCmdAsync(resolved.Url!, NvaJson.GetString(parameters?["seekTs"], "0"), cancellationToken,
-            resolved.AudioUrl);
+            resolved.AudioUrl, resolved.Segments);
     }
 
     private async Task HandlePlayUrlAsync(int counter, JsonNode? parameters, CancellationToken cancellationToken)
@@ -1164,7 +1184,6 @@ public sealed class NvaClient
         await SendResponseAsync(counter, null, cancellationToken);
 
         var url = NvaJson.GetString(parameters?["url"]);
-        _title = NvaJson.GetString(parameters?["title"]);
 
         var videoInfo = BilibiliApi.ParseNvaExtension(url);
         var version = NvaJson.GetInt(videoInfo?["ver"], -1);
@@ -1174,6 +1193,16 @@ public sealed class NvaClient
         }
 
         var content = videoInfo?["content"] as JsonObject;
+        if (content is null || NvaJson.GetString(content["cid"]).Length == 0)
+        {
+            Log.Warn("NVA PlayUrl: missing video content");
+            return;
+        }
+        await _manager.CancelExtraInfoAsync();
+        _manager.SetPlayList(Array.Empty<NvaPlayItem>(), 0);
+        _roomId = "0";
+        _titleP = string.Empty;
+        _title = NvaJson.GetString(parameters?["title"]);
         _qn = new JsonObject
         {
             ["curQn"] = 0,
@@ -1189,7 +1218,6 @@ public sealed class NvaClient
             ["userDesireQn"] = 0
         };
 
-        // todo: 开始时 seek（python 版同样未处理 PlayUrl 的额外字段）
         // ver=2 uses long keys (x13.e.a in the phone app); the older NvaExtContent
         // variant uses short ones (key/sid/eid/ct/sk), so accept both.
         _aid = NvaJson.GetString(content?["aid"]);
@@ -1246,7 +1274,7 @@ public sealed class NvaClient
         var seek = content?["seekTs"] is not null
             ? NvaJson.GetString(content?["seekTs"])
             : NvaJson.GetString(content?["sk"], "0");
-        await SendPlayCmdAsync(resolved.Url!, seek, cancellationToken, resolved.AudioUrl);
+        await SendPlayCmdAsync(resolved.Url!, seek, cancellationToken, resolved.AudioUrl, resolved.Segments);
     }
 
     private async Task HandleSeekAsync(int counter, JsonNode? parameters, CancellationToken cancellationToken)
@@ -1269,15 +1297,16 @@ public sealed class NvaClient
 
     public async Task<NvaPlayUrlResult?> ResolvePlayUrlAsync(CancellationToken cancellationToken)
     {
+        var accessKey = _accessKey.Length > 0 ? _accessKey : NvaCredentials.GetAccessKey(Host.Settings);
         var request = new NvaPlayUrlRequest
         {
-            AccessKey = _accessKey,
+            AccessKey = accessKey,
             Cid = _cid,
             Oid = _oid,
             OgvAid = _aid,
             DesireQn = _desireQn,
             PlayUrlType = _playUrlType,
-            // Only mpv-family renderers can attach the separate DASH audio track.
+            // MPV/Live and PotPlayer can play DASH video with its separate audio.
             PreferDash = Host.Renderer is IAudioTrackRenderer
         };
 
@@ -1287,20 +1316,28 @@ public sealed class NvaClient
             return null;
         }
 
+        if (result.Segments is { Count: > 1 } && Host.Renderer is not ISegmentedRenderer)
+        {
+            Log.Warn("NVA: this video has multiple segments; select MPV or Live to play the complete video");
+            Host.SetState("TransportStatus", "ERROR_OCCURRED");
+            return null;
+        }
         _currentQn = result.CurrentQn;
         _qn = result.Qn;
-        Log.Info($"NVA playurl: curQn={result.CurrentQn} desireQn={_desireQn} " +
-                 $"dash={(result.AudioUrl is not null ? "yes" : "no")} accessKey={(_accessKey.Length > 0 ? "yes" : "no")}");
         return result;
     }
 
     public async Task SendPlayCmdAsync(string url, string start, CancellationToken cancellationToken,
-        string? audioUrl = null)
+        string? audioUrl = null, IReadOnlyList<MediaSegment>? segments = null)
     {
         Host.SetState("CurrentTrackURI", url);
 
         var renderer = Host.Renderer;
-        if (!string.IsNullOrEmpty(audioUrl) && renderer is IAudioTrackRenderer audioRenderer)
+        if (segments is { Count: > 1 } && renderer is ISegmentedRenderer segmented)
+        {
+            segmented.SetMediaSegments(segments, start);
+        }
+        else if (!string.IsNullOrEmpty(audioUrl) && renderer is IAudioTrackRenderer audioRenderer)
         {
             audioRenderer.SetMediaUrlWithAudio(url, start, audioUrl);
         }
@@ -1315,15 +1352,15 @@ public sealed class NvaClient
         // 通知客户端，正在加载
         await _manager.BroadcastAsync("OnPlayState", new JsonObject { ["playState"] = 3 }, cancellationToken);
         await UpdatePlayStateAsync(cancellationToken);
-        _ = Task.Run(GetExtraInfoAsync, CancellationToken.None);
+        await _manager.StartExtraInfoAsync(GetExtraInfoAsync);
     }
 
     public async Task UpdatePlayStateAsync(CancellationToken cancellationToken)
     {
-        // Honour the current switch even when the phone did not ask to persist it,
-        // otherwise every new episode silently turns danmaku back on.
-        var danmakuOpen = NvaJson.ParseBool(Host.GetState("DisplayCurrentSubtitle"), true);
+        // Both SOAP and control-channel switches update the shared preference.
+        var danmakuOpen = _danmakuSwitchSave;
 
+        Host.SetState("DisplayCurrentSubtitle", danmakuOpen ? "true" : "false");
         Host.Renderer?.SetMediaSubShow(danmakuOpen);
         await _manager.BroadcastAsync("OnDanmakuSwitch", new JsonObject { ["open"] = danmakuOpen },
             cancellationToken);
@@ -1354,8 +1391,15 @@ public sealed class NvaClient
         }, cancellationToken);
     }
 
-    private async Task GetExtraInfoAsync()
+    private async Task GetExtraInfoAsync(CancellationToken cancellationToken)
     {
+        var cid = _cid;
+        var oid = _oid;
+        var seasonId = _seasonId;
+        var epid = _epid;
+        var contentType = _contentType;
+        var subtitlePath = Path.Combine(AppSettings.ConfigDir, "macast.ass");
+        var pendingPath = subtitlePath + "." + Guid.NewGuid().ToString("N") + ".tmp";
         try
         {
             // 直播暂不获取额外的信息
@@ -1366,30 +1410,34 @@ public sealed class NvaClient
             }
 
             Log.Info("NVA: start get_extra_info");
-            var subtitlePath = Path.Combine(AppSettings.ConfigDir, "macast.ass");
-            var downloaded = await Host.Bilibili.DownloadDanmakuAsync(_cid, subtitlePath, CancellationToken.None);
+            var downloaded = await Host.Bilibili.DownloadDanmakuAsync(cid, pendingPath, cancellationToken);
+            cancellationToken.ThrowIfCancellationRequested();
             if (downloaded is not null)
             {
-                Host.Renderer?.SetMediaSubFile(downloaded, "弹幕");
+                File.Move(downloaded, subtitlePath, overwrite: true);
+                Host.Renderer?.SetMediaSubFile(subtitlePath, "弹幕");
             }
 
-            // 不获取课程的视频信息
-            if (_contentType != 0 && _contentType != 2)
-            {
-                await LoadVideoInfoAsync();
-            }
+            if (contentType != 0 && contentType != 2)
+                await LoadVideoInfoAsync(oid, seasonId, epid, cid, cancellationToken);
 
             Log.Info("NVA: end get_extra_info");
         }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { }
         catch (Exception ex)
         {
             Log.Warn($"NVA get_extra_info failed: {ex.Message}");
         }
+        finally
+        {
+            if (File.Exists(pendingPath)) File.Delete(pendingPath);
+        }
     }
 
-    private async Task LoadVideoInfoAsync()
+    private async Task LoadVideoInfoAsync(string oid, int seasonId, int epid, string cid, CancellationToken cancellationToken)
     {
-        var info = await Host.Bilibili.GetVideoInfoAsync(_oid, _seasonId, _epid, _cid, CancellationToken.None);
+        var info = await Host.Bilibili.GetVideoInfoAsync(oid, seasonId, epid, cid, cancellationToken);
+        cancellationToken.ThrowIfCancellationRequested();
         if (info is null)
         {
             Log.Warn("NVA: get_video_info failed");
@@ -1400,8 +1448,8 @@ public sealed class NvaClient
         _isPortrait = info.IsPortrait;
         if (info.CurrentEpisodeTitle.Length > 0)
         {
-            // 注意：python 版这里只更新播放器标题，不写回 self.title_p
-            Host.Renderer?.SetMediaTitle($"{_title} {info.CurrentEpisodeTitle}");
+            _titleP = info.CurrentEpisodeTitle;
+            Host.Renderer?.SetMediaTitle($"{_title} {_titleP}");
         }
 
         _manager.SetPlayList(info.PlayList, info.PlayIndex);
@@ -1414,6 +1462,8 @@ public sealed class NvaClient
             return false;
         }
 
+        if (qn <= 0) return false;
+        await _manager.CancelExtraInfoAsync();
         _desireQn = qn;
         var resolved = await ResolvePlayUrlAsync(cancellationToken);
         if (resolved is null)
@@ -1423,7 +1473,7 @@ public sealed class NvaClient
         }
 
         var position = Host.GetState("RelativeTimePosition");
-        await SendPlayCmdAsync(resolved.Url!, position, cancellationToken, resolved.AudioUrl);
+        await SendPlayCmdAsync(resolved.Url!, position, cancellationToken, resolved.AudioUrl, resolved.Segments);
         return true;
     }
 
@@ -1433,11 +1483,15 @@ public sealed class NvaClient
     {
         _cid = item.Cid;
         _aid = item.Aid;
-        _oid = item.Aid;
+        _oid = string.IsNullOrEmpty(item.Oid) ? item.Aid : item.Oid;
+        _epid = 0;
+        _roomId = "0";
+        _playUrlType = 1;
         if (!IsZeroEpid(item.Epid))
         {
             _oid = item.Epid;
             _epid = NvaCasting.ParseInt(item.Epid, 0);
+            _playUrlType = 2;
         }
 
         _titleP = item.Title;

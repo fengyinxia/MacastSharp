@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Globalization;
+using System.Net;
 using System.Net.Http.Headers;
 using System.Reflection;
 using System.Text;
@@ -11,7 +12,7 @@ using Macast.Core.Utils;
 
 namespace Macast.Core.Upnp;
 
-public sealed class DlnaProtocol
+public sealed class DlnaProtocol : IAsyncDisposable
 {
     private static readonly XNamespace SoapNs = "http://schemas.xmlsoap.org/soap/envelope/";
 
@@ -34,9 +35,13 @@ public sealed class DlnaProtocol
     private readonly Dictionary<string, StateVariable> _state = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, EventSubscription> _subscriptions = new();
     private readonly Channel<(string Name, string Value)> _events =
-        Channel.CreateUnbounded<(string, string)>(new UnboundedChannelOptions { SingleReader = true });
-    private readonly HttpClient _http = new() { Timeout = TimeSpan.FromSeconds(5) };
+        Channel.CreateBounded<(string, string)>(new BoundedChannelOptions(256)
+        { SingleReader = true, FullMode = BoundedChannelFullMode.DropOldest });
+    private readonly HttpClient _http = new(new HttpClientHandler
+    { AllowAutoRedirect = false, UseProxy = false }) { Timeout = TimeSpan.FromSeconds(5) };
     private CancellationTokenSource? _cts;
+    private Task _eventTask = Task.CompletedTask;
+    private Task _cleanupTask = Task.CompletedTask;
 
     public IRenderer? Renderer { get; set; }
 
@@ -114,16 +119,30 @@ public sealed class DlnaProtocol
             // Drop events queued before the restart.
         }
 
-        _ = Task.Run(() => EventLoopAsync(_cts.Token));
-        _ = Task.Run(() => CleanupLoopAsync(_cts.Token));
+        _eventTask = EventLoopAsync(_cts.Token);
+        _cleanupTask = CleanupLoopAsync(_cts.Token);
         SetState("TransportState", "STOPPED");
     }
 
-    public void Stop()
+    public async Task StopAsync()
     {
-        _cts?.Cancel();
-        _cts?.Dispose();
+        if (_cts is null) return;
+        _cts.Cancel();
+        try
+        {
+            await Task.WhenAll(_subscriptions.Values.Select(s => s.InitialEvent)
+                .Append(_eventTask).Append(_cleanupTask));
+        }
+        catch (OperationCanceledException) { }
+        _subscriptions.Clear();
+        _cts.Dispose();
         _cts = null;
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        await StopAsync();
+        _http.Dispose();
     }
 
     public string GetState(string name) => _state.TryGetValue(name, out var variable) ? variable.Value : string.Empty;
@@ -267,7 +286,7 @@ public sealed class DlnaProtocol
         return Encoding.UTF8.GetBytes(fault.ToString(SaveOptions.DisableFormatting));
     }
 
-    public (string Sid, string Timeout) Subscribe(string service, string callback, int timeoutSeconds)
+    public (string Sid, string Timeout) Subscribe(string service, string callback, int timeoutSeconds, IPAddress? remoteAddress = null)
     {
         if (!_services.ContainsKey(service))
         {
@@ -281,20 +300,34 @@ public sealed class DlnaProtocol
             throw new InvalidDataException($"invalid callback URL: {callback}");
         }
 
-        foreach (var existing in _subscriptions.Values)
-        {
-            if (string.Equals(existing.Service, service, StringComparison.Ordinal) &&
-                string.Equals(existing.Callback, cleanCallback, StringComparison.Ordinal))
-            {
-                existing.Renew(timeoutSeconds);
-                return (existing.Sid, $"Second-{existing.TimeoutSeconds}");
-            }
-        }
+        // Use literal addresses so callback validation cannot be bypassed by DNS changes.
+        var callbackAddress = IPAddress.TryParse(uri.Host.Trim('[', ']'), out var parsed) ? parsed : null;
+        if (remoteAddress is null || callbackAddress is null ||
+            !callbackAddress.MapToIPv6().Equals(remoteAddress.MapToIPv6()) || uri.UserInfo.Length > 0)
+            throw new InvalidDataException("callback must point to the subscribing client");
 
-        var subscription = new EventSubscription(service, cleanCallback, timeoutSeconds);
-        _subscriptions[subscription.Sid] = subscription;
-        _ = SendInitialEventAsync(subscription);
-        return (subscription.Sid, $"Second-{subscription.TimeoutSeconds}");
+        cleanCallback = new UriBuilder(uri) { Host = callbackAddress.ToString() }.Uri.AbsoluteUri;
+        lock (_subscriptions)
+        {
+            foreach (var existing in _subscriptions.Values)
+            {
+                if (existing.Service == service && existing.Callback == cleanCallback)
+                {
+                    existing.Renew(timeoutSeconds);
+                    return (existing.Sid, $"Second-{existing.TimeoutSeconds}");
+                }
+            }
+
+            if (_subscriptions.Count >= 64 || _subscriptions.Values.Count(s =>
+                    new Uri(s.Callback).Host == uri.Host) >= 8)
+                throw new InvalidDataException("too many event subscriptions");
+
+            var token = _cts?.Token ?? throw new InvalidOperationException("protocol is stopped");
+            var subscription = new EventSubscription(service, cleanCallback, timeoutSeconds);
+            _subscriptions[subscription.Sid] = subscription;
+            subscription.InitialEvent = SendInitialEventAsync(subscription, token);
+            return (subscription.Sid, $"Second-{subscription.TimeoutSeconds}");
+        }
     }
 
     public bool Renew(string sid, int timeoutSeconds)
@@ -310,7 +343,7 @@ public sealed class DlnaProtocol
 
     public bool Unsubscribe(string sid) => _subscriptions.TryRemove(sid, out _);
 
-    private async Task SendInitialEventAsync(EventSubscription subscription)
+    private async Task SendInitialEventAsync(EventSubscription subscription, CancellationToken token)
     {
         var data = new Dictionary<string, string>(StringComparer.Ordinal);
         if (ObservedStates.TryGetValue(subscription.Service, out var names))
@@ -321,7 +354,7 @@ public sealed class DlnaProtocol
             }
         }
 
-        await SendEventSafeAsync(subscription, data, CancellationToken.None);
+        await SendEventSafeAsync(subscription, data, token);
     }
 
     private async Task EventLoopAsync(CancellationToken token)
@@ -350,12 +383,13 @@ public sealed class DlnaProtocol
                     }
 
                     var data = group.ToDictionary(pair => pair.Key, pair => pair.Value, StringComparer.Ordinal);
-                    foreach (var subscription in _subscriptions.Values
-                                 .Where(s => string.Equals(s.Service, group.Key, StringComparison.Ordinal))
-                                 .ToArray())
-                    {
-                        _ = SendEventSafeAsync(subscription, data, token);
-                    }
+                    await Task.WhenAll(_subscriptions.Values
+                        .Where(s => string.Equals(s.Service, group.Key, StringComparison.Ordinal))
+                        .Select(async subscription =>
+                        {
+                            await subscription.InitialEvent;
+                            await SendEventSafeAsync(subscription, data, token);
+                        }));
                 }
 
                 buffer.Clear();

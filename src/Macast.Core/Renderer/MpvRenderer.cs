@@ -6,12 +6,13 @@ using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
 using Macast.Core.Plugins;
+using Macast.Core.Plugins.Builtin;
 using Macast.Core.Settings;
 using Macast.Core.Utils;
 
 namespace Macast.Core.Renderer;
 
-public sealed class MpvRenderer : IRenderer, IAudioTrackRenderer
+public sealed class MpvRenderer : IRenderer, IAudioTrackRenderer, ISegmentedRenderer
 {
     private readonly AppSettings _settings;
     private readonly IProtocolStateSink _protocol;
@@ -135,43 +136,19 @@ public sealed class MpvRenderer : IRenderer, IAudioTrackRenderer
         _processTask = null;
         _ipcTask = null;
         _pendingCommands.Clear();
+        _pendingRequests.Clear();
         _simulated = false;
     }
 
-    private bool MpvExists()
+    public void Dispose()
     {
-        if (!string.IsNullOrWhiteSpace(_profile.ExecutablePath))
-        {
-            return File.Exists(_profile.ExecutablePath);
-        }
-
-        var path = _settings.MpvDefaultPath;
-        if (Path.IsPathRooted(path))
-        {
-            return File.Exists(path);
-        }
-
-        if (!string.Equals(path, "mpv", StringComparison.OrdinalIgnoreCase))
-        {
-            var candidate = Path.Combine(AppContext.BaseDirectory, path);
-            if (File.Exists(candidate))
-            {
-                return true;
-            }
-        }
-
-        var exe = OperatingSystem.IsWindows() ? "mpv.exe" : "mpv";
-        var cwdCandidate = Path.Combine(Environment.CurrentDirectory, "bin", exe);
-        if (File.Exists(cwdCandidate))
-        {
-            return true;
-        }
-
-        var env = Environment.GetEnvironmentVariable("PATH") ?? string.Empty;
-        return env.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries)
-            .Select(dir => Path.Combine(dir.Trim(), exe))
-            .Any(File.Exists);
+        Stop();
+        _cts.Dispose();
     }
+
+    private bool MpvExists() => !string.IsNullOrWhiteSpace(_profile.ExecutablePath)
+        ? File.Exists(_profile.ExecutablePath)
+        : MpvRendererPlugin.ResolveMpv(_settings) is not null;
 
     private async Task ProcessLoopAsync()
     {
@@ -310,30 +287,8 @@ public sealed class MpvRenderer : IRenderer, IAudioTrackRenderer
             return _profile.ExecutablePath;
         }
 
-        var configured = _settings.MpvDefaultPath;
-        if (Path.IsPathRooted(configured))
-        {
-            return configured;
-        }
-
-        if (!string.Equals(configured, "mpv", StringComparison.OrdinalIgnoreCase))
-        {
-            var candidate = Path.Combine(AppContext.BaseDirectory, configured);
-            if (File.Exists(candidate))
-            {
-                return candidate;
-            }
-        }
-
-        var exe = OperatingSystem.IsWindows() ? "mpv.exe" : "mpv";
-        var bundled = Path.Combine(AppContext.BaseDirectory, "bin", exe);
-        if (File.Exists(bundled))
-        {
-            return bundled;
-        }
-
-        var cwdBundled = Path.Combine(Environment.CurrentDirectory, "bin", exe);
-        return File.Exists(cwdBundled) ? cwdBundled : configured;
+        return MpvRendererPlugin.ResolveMpv(_settings)
+            ?? throw new FileNotFoundException("未找到 MPV，请在插件设置中配置程序路径。");
     }
 
     private async Task PumpOutputAsync(StreamReader? reader)
@@ -419,14 +374,30 @@ public sealed class MpvRenderer : IRenderer, IAudioTrackRenderer
         if (OperatingSystem.IsWindows())
         {
             var pipe = new NamedPipeClientStream(".", _pipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
-            await pipe.ConnectAsync(2000, token);
-            _stream = pipe;
+            try
+            {
+                await pipe.ConnectAsync(2000, token);
+                _stream = pipe;
+            }
+            catch
+            {
+                pipe.Dispose();
+                throw;
+            }
         }
         else
         {
             var socket = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
-            await socket.ConnectAsync(new UnixDomainSocketEndPoint(_ipcPath), token);
-            _stream = new NetworkStream(socket, ownsSocket: true);
+            try
+            {
+                await socket.ConnectAsync(new UnixDomainSocketEndPoint(_ipcPath), token);
+                _stream = new NetworkStream(socket, ownsSocket: true);
+            }
+            catch
+            {
+                socket.Dispose();
+                throw;
+            }
         }
 
         _reader = new StreamReader(_stream, new UTF8Encoding(false), false, 64 * 1024, leaveOpen: true);
@@ -485,13 +456,13 @@ public sealed class MpvRenderer : IRenderer, IAudioTrackRenderer
                 _pendingRequests.TryRemove(requestId, out var description);
                 if (!string.Equals(error, "success", StringComparison.OrdinalIgnoreCase))
                 {
-                    Log.Warn($"mpv command error: {error} for [{description ?? "unknown"}] ({line})");
+                    Log.Warn($"mpv command error: {error} for request {requestId}");
                 }
             }
         }
         catch (Exception ex)
         {
-            Log.Debug($"invalid mpv message: {ex.Message}: {line}");
+            Log.Debug($"invalid mpv message: {ex.Message}");
         }
     }
 
@@ -623,10 +594,10 @@ public sealed class MpvRenderer : IRenderer, IAudioTrackRenderer
         }
 
         var id = Interlocked.Increment(ref _requestId);
-        var description = string.Join(" ", command.Select(item => item?.ToString() ?? string.Empty));
+        var description = command.FirstOrDefault()?.ToString() ?? string.Empty;
         _pendingRequests[id] = description;
         var json = JsonSerializer.Serialize(new { command, request_id = id });
-        Log.Debug("mpv <- " + json);
+        Log.Debug($"mpv <- {command.FirstOrDefault()} request={id}");
         await _writeLock.WaitAsync();
         try
         {
@@ -636,6 +607,7 @@ public sealed class MpvRenderer : IRenderer, IAudioTrackRenderer
         }
         catch (Exception ex)
         {
+            _pendingRequests.TryRemove(id, out _);
             Log.Debug($"send mpv command failed: {ex.Message}");
             return false;
         }
@@ -750,6 +722,14 @@ public sealed class MpvRenderer : IRenderer, IAudioTrackRenderer
     /// </summary>
     public void SetMediaUrlWithAudio(string url, string start, string audioUrl) =>
         SetMediaUrlCore(url, start, audioUrl);
+
+    public void SetMediaSegments(IReadOnlyList<MediaSegment> segments, string start)
+    {
+        // Explicit lengths also work when a remote demuxer cannot probe duration.
+        var edl = "edl://" + string.Join(";", segments.Select(segment =>
+            $"%{Encoding.UTF8.GetByteCount(segment.Url)}%{segment.Url},length={segment.DurationSeconds.ToString(CultureInfo.InvariantCulture)}"));
+        SetMediaUrl(edl, start);
+    }
 
     private void SetMediaUrlCore(string url, string start, string? audioUrl)
     {

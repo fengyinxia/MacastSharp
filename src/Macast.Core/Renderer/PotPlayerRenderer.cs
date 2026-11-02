@@ -14,7 +14,7 @@ namespace Macast.Core.Renderer;
 /// seek are driven by the player's own hotkeys, and the position is an estimate
 /// that only advances while playback is considered active.
 /// </summary>
-public sealed class PotPlayerRenderer : IRenderer, IDisposable
+public sealed class PotPlayerRenderer : IRenderer, IAudioTrackRenderer
 {
     private const string Path64 = @"C:\Program Files\DAUM\PotPlayer\PotPlayerMini64.exe";
     private const string Path32 = @"C:\Program Files (x86)\DAUM\PotPlayer\PotPlayerMini.exe";
@@ -377,7 +377,12 @@ public sealed class PotPlayerRenderer : IRenderer, IDisposable
         _protocol.SetState("AbsoluteTimePosition", text);
     }
 
-    public void SetMediaUrl(string url, string start = "0")
+    public void SetMediaUrl(string url, string start = "0") => SetMediaUrlCore(url, start, null);
+
+    public void SetMediaUrlWithAudio(string url, string start, string audioUrl) =>
+        SetMediaUrlCore(url, start, audioUrl);
+
+    private void SetMediaUrlCore(string url, string start, string? audioUrl)
     {
         KillPlayer();
         var startSeconds = MediaTime.ToSeconds(start);
@@ -398,34 +403,12 @@ public sealed class PotPlayerRenderer : IRenderer, IDisposable
 
         try
         {
-            var title = _settings.GetString("DLNA_FriendlyName", "Macast");
-            var info = new ProcessStartInfo(exe)
-            {
-                UseShellExecute = false,
-                CreateNoWindow = true
-            };
-            info.ArgumentList.Add(url);
-            info.ArgumentList.Add("/autoplay");
-            if (startSeconds > 0)
-            {
-                info.ArgumentList.Add($"/seek={MediaTime.FromSeconds(startSeconds)}");
-            }
-
-            if (!string.IsNullOrWhiteSpace(title))
-            {
-                info.ArgumentList.Add($"/title={title}");
-            }
-
-            if (File.Exists(_subtitlePath))
-            {
-                info.ArgumentList.Add($"/sub={_subtitlePath}");
-            }
-
+            var info = BuildStartInfo(exe, url, startSeconds, audioUrl);
             _player = Process.Start(info);
             _playing = true;
             _protocol.SetState("TransportStatus", "OK");
             _protocol.SetState("TransportState", "PLAYING");
-            Log.Info($"potplayer started, pid={_player?.Id}, exe={exe}, url={url}, seek={MediaTime.FromSeconds(startSeconds)}");
+            Log.Info($"potplayer started, pid={_player?.Id}, exe={exe}, externalAudio={!string.IsNullOrWhiteSpace(audioUrl)}, seek={MediaTime.FromSeconds(startSeconds)}");
 
             _window = FindPlayerWindow(WindowWait);
             if (_window == IntPtr.Zero)
@@ -447,6 +430,26 @@ public sealed class PotPlayerRenderer : IRenderer, IDisposable
             _protocol.SetState("TransportStatus", "ERROR_OCCURRED");
             _protocol.SetState("TransportState", "STOPPED");
         }
+    }
+
+    private ProcessStartInfo BuildStartInfo(string exe, string url, double startSeconds, string? audioUrl)
+    {
+        var info = new ProcessStartInfo(exe) { UseShellExecute = false, CreateNoWindow = true };
+        info.ArgumentList.Add(url);
+        if (!string.IsNullOrWhiteSpace(audioUrl))
+        {
+            info.ArgumentList.Add(audioUrl);
+            // /same loads the URLs as streams of one item, not two playlist entries.
+            info.ArgumentList.Add("/same");
+            info.ArgumentList.Add("/referer=https://www.bilibili.com/");
+        }
+        info.ArgumentList.Add("/autoplay");
+        if (startSeconds > 0)
+            info.ArgumentList.Add($"/seek={MediaTime.FromSeconds(startSeconds)}");
+        var title = _settings.GetString("DLNA_FriendlyName", "Macast");
+        if (!string.IsNullOrWhiteSpace(title)) info.ArgumentList.Add($"/title={title}");
+        if (File.Exists(_subtitlePath)) info.ArgumentList.Add($"/sub={_subtitlePath}");
+        return info;
     }
 
     private void KillPlayer()

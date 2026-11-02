@@ -31,9 +31,10 @@ internal static class PlayUrlProbe
         var accessKey = Option("--access-key", Environment.GetEnvironmentVariable("BILI_ACCESS_KEY") ?? "");
         var qn = int.TryParse(Option("--qn", "80"), out var parsedQn) ? parsedQn : 80;
         var dash = !args.Contains("--no-dash");
-        var platform = Option("--platform", "ios");
-        var build = Option("--build", "36700100");
-        var mobiApp = Option("--mobi-app", "");
+        var defaults = new NvaPlayUrlRequest();
+        var platform = Option("--platform", defaults.Platform);
+        var build = Option("--build", defaults.Build);
+        var mobiApp = Option("--mobi-app", defaults.MobiApp);
         var showUrls = args.Contains("--show-urls");
 
         if (aid.Length == 0 || cid.Length == 0)
@@ -47,10 +48,10 @@ internal static class PlayUrlProbe
         {
             AccessKey = accessKey,
             Cid = cid,
-            Oid = oid,
+            Oid = int.TryParse(epid, out var episodeId) && episodeId != 0 ? epid : oid,
             OgvAid = aid,
             DesireQn = qn,
-            PlayUrlType = int.Parse(epid) != 0 ? 2 : 1,
+            PlayUrlType = episodeId != 0 ? 2 : 1,
             PreferDash = dash,
             Platform = platform,
             Build = build,

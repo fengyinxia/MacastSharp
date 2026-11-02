@@ -6,7 +6,7 @@ public sealed class DlnaProtocolPlugin : IProtocolPlugin
 {
     public MacastPlugin Metadata { get; } = new DlnaMetadata();
 
-    public IProtocolService Create(ProtocolContext context) => new DlnaProtocolService(context.Settings);
+    public IProtocolService Create(ProtocolContext context) => new DlnaProtocolService(context.Settings, context.LoopbackOnly);
 
     private sealed class DlnaMetadata : MacastPlugin
     {

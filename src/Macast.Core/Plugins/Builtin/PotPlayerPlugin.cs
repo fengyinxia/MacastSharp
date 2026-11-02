@@ -17,7 +17,7 @@ public sealed class PotPlayerPlugin : IRendererPlugin
 
         public override string Title => "PotPlayer Renderer";
 
-        public override string Description => "用 PotPlayer 播放投屏内容；PotPlayer 无 IPC，播放位置为估算，暂停/静音/跳转通过播放器热键触发";
+        public override string Description => "用 PotPlayer 播放投屏内容，支持 DASH 分离音视频；播放位置为估算，暂停/静音/跳转通过播放器热键触发";
 
         public override string Author => "xfangfang";
 

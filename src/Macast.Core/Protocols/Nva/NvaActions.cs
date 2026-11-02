@@ -29,8 +29,6 @@ public sealed class NvaActions
     // nirvana.py answers GetAppInfo with Setting.get(SignedIn, False): a device without a
     // stored access key must NOT claim to be signed in, otherwise the client skips the
     // login flow and playurl silently degrades.
-    private bool _signedIn;
-    private string _accessKey = string.Empty;
     private bool _danmakuSwitch = true;
 
     public NvaActions(NvaProtocolService service)
@@ -38,8 +36,6 @@ public sealed class NvaActions
         _service = service;
         _stateDefaults = LoadStateDefaults();
         _danmakuSwitch = NvaJson.ParseBool(StateDefault("DanmakuSwitch"), true);
-        _accessKey = service.Settings.GetString("NVA_AccessKey", string.Empty);
-        _signedIn = _accessKey.Length > 0;
     }
 
     public string SCPath => Path.Combine(AssetPaths.XmlDir, "NirvanaControl.xml");
@@ -90,7 +86,7 @@ public sealed class NvaActions
 
     // ---- SOAP ----------------------------------------------------------
 
-    public byte[] Call(byte[] rawBody)
+    public async Task<byte[]> CallAsync(byte[] rawBody, CancellationToken cancellationToken)
     {
         XDocument document;
         try
@@ -123,14 +119,14 @@ public sealed class NvaActions
         var result = actionName switch
         {
             "GetAppInfo" => GetAppInfo(),
-            "LoginWithCode" => LoginWithCode(parameters),
+            "LoginWithCode" => await LoginWithCodeAsync(parameters, cancellationToken),
             "PrepareForMirrorProjection" => PrepareForMirrorProjection(),
             "SetDanmakuSwitch" => SetDanmakuSwitch(parameters),
             "AppendDanmaku" => AppendDanmaku(parameters),
             "GetPlayInfo" => GetPlayInfo(),
             "GetDanmaku" => GetDanmaku(),
-            "GetAccountInfo" => GetAccountInfo(),
-            "SwitchQuality" => SwitchQuality(parameters),
+            "GetAccountInfo" => await GetAccountInfoAsync(cancellationToken),
+            "SwitchQuality" => await SwitchQualityAsync(parameters, cancellationToken),
             _ => throw new InvalidDataException($"unknown action: {ServiceName}/{actionName}")
         };
 
@@ -144,10 +140,10 @@ public sealed class NvaActions
         ["PackageName"] = StateDefault("A_ARG_TYPE_PackageName"),
         ["AppKey"] = StateDefault("A_ARG_TYPE_AppKey"),
         ["Signature"] = StateDefault("A_ARG_TYPE_Signature"),
-        ["CurrentSignedIn"] = _signedIn ? "1" : "0"
+        ["CurrentSignedIn"] = NvaCredentials.GetAccessKey(_service.Settings).Length > 0 ? "1" : "0"
     };
 
-    private Dictionary<string, string> LoginWithCode(IReadOnlyDictionary<string, string> parameters)
+    private async Task<Dictionary<string, string>> LoginWithCodeAsync(IReadOnlyDictionary<string, string> parameters, CancellationToken cancellationToken)
     {
         var code = parameters.TryGetValue("Code", out var raw) ? raw.Trim() : string.Empty;
         if (code.Length == 0)
@@ -159,20 +155,20 @@ public sealed class NvaActions
         try
         {
             // python 0.33只有 action 声明，没有实现；这里用 B 站 TV 登录 poll 兑换 access_key。
-            var login = _service.Bilibili.PollTvLoginAsync(code, CancellationToken.None).GetAwaiter().GetResult();
+            var login = await _service.Bilibili.PollTvLoginAsync(code, cancellationToken);
             if (login is null || login.AccessKey.Length == 0)
             {
                 Log.Warn("NVA LoginWithCode: code was not accepted (expired or already used)");
                 return Empty();
             }
 
-            _accessKey = login.AccessKey;
-            _signedIn = true;
             _service.Settings.Set("NVA_AccessKey", login.AccessKey);
+            _service.Settings.Set("NVA_AccessKeyExpiresAt", login.ExpiresIn > 0
+                ? DateTimeOffset.UtcNow.ToUnixTimeSeconds() + login.ExpiresIn : 0);
             _service.Settings.Save();
             Log.Info($"NVA LoginWithCode: signed in (mid {login.Mid}, expires in {login.ExpiresIn}s)");
         }
-        catch (Exception ex)
+        catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
         {
             Log.Error($"NVA LoginWithCode failed: {ex.Message}");
         }
@@ -248,15 +244,15 @@ public sealed class NvaActions
         };
     }
 
-    private Dictionary<string, string> GetAccountInfo()
+    private async Task<Dictionary<string, string>> GetAccountInfoAsync(CancellationToken cancellationToken)
     {
-        var accessKey = _accessKey.Length > 0 ? _accessKey : _service.Settings.GetString("NVA_AccessKey");
+        var accessKey = NvaCredentials.GetAccessKey(_service.Settings);
         var vipInfo = 0;
         try
         {
-            vipInfo = _service.Bilibili.GetVipInfoAsync(accessKey, CancellationToken.None).GetAwaiter().GetResult();
+            vipInfo = await _service.Bilibili.GetVipInfoAsync(accessKey, cancellationToken);
         }
-        catch (Exception ex)
+        catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
         {
             Log.Warn($"NVA GetAccountInfo failed: {ex.Message}");
         }
@@ -267,11 +263,11 @@ public sealed class NvaActions
         };
     }
 
-    private Dictionary<string, string> SwitchQuality(IReadOnlyDictionary<string, string> parameters)
+    private async Task<Dictionary<string, string>> SwitchQualityAsync(IReadOnlyDictionary<string, string> parameters, CancellationToken cancellationToken)
     {
         var qn = parameters.TryGetValue("Qn", out var raw) ? NvaCasting.ParseInt(raw, 0) : 0;
         // 等价于 NVA 命令 SwitchQn（python 版由客户端长连接发命令，SOAP 里没有实现）
-        var applied = _service.Casting.ApplyQualityAsync(qn, CancellationToken.None).GetAwaiter().GetResult();
+        var applied = await _service.Casting.ApplyQualityAsync(qn, cancellationToken);
         if (!applied)
         {
             Log.Warn($"NVA SwitchQuality: qn {qn} was not applied (no client or no playable url)");

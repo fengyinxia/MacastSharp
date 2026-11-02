@@ -1,6 +1,7 @@
 using System.Text;
 using Macast.Core.Plugins;
 using Macast.Core.Renderer;
+using Macast.Core.Server;
 using Macast.Core.Settings;
 using Macast.Core.Upnp;
 using Macast.Core.Utils;
@@ -11,7 +12,7 @@ namespace Macast.Core.Protocols.Nva;
 /// The NVA (nirvana / 哔哩必连) protocol service, ported from nirvana.py.
 ///
 /// It keeps the stock <see cref="DlnaProtocol"/> for SOAP / state / GENA and puts the raw
-/// <see cref="NvaHttpServer"/> in front of it, because the bilibili client speaks "NVA/1.0"
+/// <see cref="SocketHttpServer"/> in front of it, because the bilibili client speaks "NVA/1.0"
 /// request lines and upgrades one connection into a binary control channel.
 /// </summary>
 public sealed class NvaProtocolService : IProtocolService, INvaCastingHost
@@ -39,17 +40,17 @@ public sealed class NvaProtocolService : IProtocolService, INvaCastingHost
 
     private readonly AppSettings _settings;
     private readonly DlnaProtocol _dlna;
-    private readonly NvaHttpServer _server;
+    private readonly SocketHttpServer _server;
     private string _description = string.Empty;
 
-    public NvaProtocolService(AppSettings settings)
+    public NvaProtocolService(AppSettings settings, bool loopbackOnly = false, BilibiliApi? bilibili = null)
     {
         _settings = settings;
         _dlna = new DlnaProtocol(settings);
-        Bilibili = new BilibiliApi();
+        Bilibili = bilibili ?? new BilibiliApi();
         Casting = new NvaCasting(this);
         Actions = new NvaActions(this);
-        _server = new NvaHttpServer(HandleAsync);
+        _server = new SocketHttpServer(HandleAsync, loopbackOnly);
     }
 
     public NvaCasting Casting { get; }
@@ -89,8 +90,9 @@ public sealed class NvaProtocolService : IProtocolService, INvaCastingHost
     public async Task StopAsync()
     {
         await _server.StopAsync();
+        await Casting.StopBackgroundAsync();
         Casting.DisconnectAll();
-        _dlna.Stop();
+        await _dlna.StopAsync();
     }
 
     public async ValueTask DisposeAsync()
@@ -98,6 +100,7 @@ public sealed class NvaProtocolService : IProtocolService, INvaCastingHost
         await StopAsync();
         await Casting.DisposeAsync();
         await _server.DisposeAsync();
+        await _dlna.DisposeAsync();
     }
 
     public void RefreshDescription()
@@ -146,7 +149,7 @@ public sealed class NvaProtocolService : IProtocolService, INvaCastingHost
 
     // ---- request routing -----------------------------------------------
 
-    private async Task<NvaResponse?> HandleAsync(NvaRequest request, Stream stream, CancellationToken cancellationToken)
+    private async Task<HttpResponseData?> HandleAsync(HttpRequestData request, Stream stream, CancellationToken cancellationToken)
     {
         var path = NormalizePath(request.Path);
 
@@ -171,7 +174,7 @@ public sealed class NvaProtocolService : IProtocolService, INvaCastingHost
             case "POST":
                 if (TrySplitService(path, "/action", out var actionService))
                 {
-                    return HandleAction(actionService, request.Body);
+                    return await HandleActionAsync(actionService, request.Body, cancellationToken);
                 }
 
                 break;
@@ -237,7 +240,7 @@ public sealed class NvaProtocolService : IProtocolService, INvaCastingHost
         return service.Length > 0 && !service.Contains('/');
     }
 
-    private NvaResponse HandleGet(string path)
+    private HttpResponseData HandleGet(string path)
     {
         if (string.Equals(path, "/description.xml", StringComparison.OrdinalIgnoreCase))
         {
@@ -253,7 +256,7 @@ public sealed class NvaProtocolService : IProtocolService, INvaCastingHost
         return NotFound();
     }
 
-    private static NvaResponse ServeAsset(string name, string requestPath)
+    private static HttpResponseData ServeAsset(string name, string requestPath)
     {
         if (name.Length == 0 || name.Contains('/') || name.Contains('\\') ||
             name.Contains("..", StringComparison.Ordinal))
@@ -277,28 +280,28 @@ public sealed class NvaProtocolService : IProtocolService, INvaCastingHost
             _ => "application/octet-stream"
         };
 
-        var response = new NvaResponse { Body = File.ReadAllBytes(file) };
+        var response = new HttpResponseData { Body = File.ReadAllBytes(file) };
         response.Headers["Content-Type"] = contentType;
         return response;
     }
 
-    private NvaResponse HandleAction(string service, byte[] body)
+    private async Task<HttpResponseData> HandleActionAsync(string service, byte[] body, CancellationToken cancellationToken)
     {
         try
         {
             var payload = string.Equals(service, NirvanaControl, StringComparison.Ordinal)
-                ? Actions.Call(body)
+                ? await Actions.CallAsync(body, cancellationToken)
                 : _dlna.Call(body);
 
-            var response = new NvaResponse { Body = payload };
+            var response = new HttpResponseData { Body = payload };
             response.Headers["Content-Type"] = "text/xml; charset=\"utf-8\"";
             response.Headers["EXT"] = string.Empty;
             return response;
         }
-        catch (Exception ex)
+        catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
         {
             Log.Warn($"NVA SOAP action {service}/action failed: {ex.Message}");
-            var fault = new NvaResponse
+            var fault = new HttpResponseData
             {
                 Status = 500,
                 StatusText = "Internal Server Error",
@@ -309,7 +312,7 @@ public sealed class NvaProtocolService : IProtocolService, INvaCastingHost
         }
     }
 
-    private NvaResponse HandleEvent(string service, NvaRequest request, bool unsubscribe)
+    private HttpResponseData HandleEvent(string service, HttpRequestData request, bool unsubscribe)
     {
         var sid = request.Header("SID");
         var callback = request.Header("CALLBACK");
@@ -348,7 +351,7 @@ public sealed class NvaProtocolService : IProtocolService, INvaCastingHost
 
         try
         {
-            var subscription = _dlna.Subscribe(service, callback, timeout);
+            var subscription = _dlna.Subscribe(service, callback, timeout, request.RemoteAddress);
             var response = Ok();
             response.Headers["SID"] = subscription.Sid;
             response.Headers["TIMEOUT"] = subscription.Timeout;
@@ -386,7 +389,7 @@ public sealed class NvaProtocolService : IProtocolService, INvaCastingHost
 
     // ---- NVA control channel -------------------------------------------
 
-    private async Task<NvaResponse?> HandleControlChannelAsync(NvaRequest request, Stream stream,
+    private async Task<HttpResponseData?> HandleControlChannelAsync(HttpRequestData request, Stream stream,
         CancellationToken cancellationToken)
     {
         var session = request.Header("Session");
@@ -421,25 +424,25 @@ public sealed class NvaProtocolService : IProtocolService, INvaCastingHost
 
     // ---- responses -----------------------------------------------------
 
-    private static NvaResponse Ok()
+    private static HttpResponseData Ok()
     {
-        var response = new NvaResponse { Body = Array.Empty<byte>() };
+        var response = new HttpResponseData { Body = Array.Empty<byte>() };
         response.Headers["Content-Type"] = "text/xml; charset=\"utf-8\"";
         return response;
     }
 
-    private static NvaResponse Status(int status, string reason)
+    private static HttpResponseData Status(int status, string reason)
     {
-        var response = new NvaResponse { Status = status, StatusText = reason, Body = Array.Empty<byte>() };
+        var response = new HttpResponseData { Status = status, StatusText = reason, Body = Array.Empty<byte>() };
         response.Headers["Content-Type"] = "text/html; charset=\"utf-8\"";
         return response;
     }
 
-    private static NvaResponse NotFound() => Status(404, "Not Found");
+    private static HttpResponseData NotFound() => Status(404, "Not Found");
 
-    private static NvaResponse Xml(string content)
+    private static HttpResponseData Xml(string content)
     {
-        var response = new NvaResponse { Body = Encoding.UTF8.GetBytes(content) };
+        var response = new HttpResponseData { Body = Encoding.UTF8.GetBytes(content) };
         response.Headers["Content-Type"] = "text/xml; charset=\"utf-8\"";
         return response;
     }

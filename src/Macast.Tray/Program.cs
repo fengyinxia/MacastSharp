@@ -7,9 +7,10 @@ namespace Macast.Tray;
 internal static class Program
 {
     [STAThread]
-    private static void Main(string[] args)
+    private static int Main(string[] args)
     {
         ApplicationConfiguration.Initialize();
+        if (args.Contains("--selftest")) return SettingsSelfTest.Run();
         Log.LogFile = Path.Combine(AppSettings.ConfigDir, "macast-cs.log");
         Log.Info($"Macast tray starting, version {AssetPaths.Version}");
 
@@ -25,14 +26,15 @@ internal static class Program
             }
             finally
             {
-                app.DisposeAsync().AsTask().GetAwaiter().GetResult();
+                Task.Run(async () => await app.DisposeAsync()).GetAwaiter().GetResult();
             }
 
-            return;
+            return 0;
         }
 
         using var tray = new TrayApp();
         tray.Start();
         Application.Run();
+        return 0;
     }
 }
