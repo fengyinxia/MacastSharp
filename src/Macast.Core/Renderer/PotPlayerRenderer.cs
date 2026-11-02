@@ -9,10 +9,9 @@ using Macast.Core.Utils;
 namespace Macast.Core.Renderer;
 
 /// <summary>
-/// Port of the PotPlayer plugin. PotPlayer has no IPC, so the C# port keeps the
-/// Python plugin's model: the process is launched with the URL, pause / mute /
-/// seek are driven by the player's own hotkeys, and the position is an estimate
-/// that only advances while playback is considered active.
+/// Starts a dedicated PotPlayer instance and controls it through bounded WM_USER
+/// messages. Window placement is scoped to that instance; decoder preferences
+/// remain under PotPlayer's own control.
 /// </summary>
 public sealed class PotPlayerRenderer : IRenderer, IAudioTrackRenderer
 {
@@ -31,7 +30,6 @@ public sealed class PotPlayerRenderer : IRenderer, IAudioTrackRenderer
 
     private readonly AppSettings _settings;
     private readonly IProtocolStateSink _protocol;
-    private readonly string _subtitlePath;
     private readonly Timer _timer;
     private readonly object _gate = new();
     private Process? _player;
@@ -39,18 +37,18 @@ public sealed class PotPlayerRenderer : IRenderer, IAudioTrackRenderer
     private double _position;
     private volatile bool _playing;
     private int _volume;
-    private int _volumeApplied = 100;
-    private int _volumeRemainder;
-    private bool _volumeSynced;
     private bool _muted;
+    private int _ticking;
+    private int _layoutPasses;
+    private DateTime _layoutDeadline;
+    private bool _initialStateApplied;
+    private double _speed = 1;
 
     public PotPlayerRenderer(RendererContext context)
     {
         _settings = context.Settings;
         _protocol = context.Protocol;
-        _subtitlePath = Path.Combine(context.ConfigDir, "macast.ass");
         _volume = _settings.GetInt("PlayerDefaultVolume", 100);
-        _volumeApplied = _volume;
         _timer = new Timer(_ => Tick(), null, Timeout.Infinite, Timeout.Infinite);
     }
 
@@ -76,7 +74,7 @@ public sealed class PotPlayerRenderer : IRenderer, IAudioTrackRenderer
     }
 
     /// <summary>Window handle found for the running player, or <see cref="IntPtr.Zero"/>.</summary>
-    public IntPtr PlayerWindow => _window != IntPtr.Zero ? _window : FindPlayerWindow(TimeSpan.Zero);
+    public IntPtr PlayerWindow => FindPlayerWindow(TimeSpan.Zero);
 
     /// <summary>
     /// Reads Potplayer_Path, then the Windows registry (DAUM keys and the
@@ -334,47 +332,67 @@ public sealed class PotPlayerRenderer : IRenderer, IAudioTrackRenderer
 
     private void Tick()
     {
+        if (Interlocked.Exchange(ref _ticking, 1) != 0) return;
+        try
+        {
+            lock (_gate) TickCore();
+        }
+        catch (Exception ex) { Log.Debug($"potplayer status query failed: {ex.Message}"); }
+        finally { Volatile.Write(ref _ticking, 0); }
+    }
+
+    private void TickCore()
+    {
         var player = _player;
-        if (player is not null)
+        if (player is null) return;
+        if (player.HasExited)
         {
-            bool exited;
-            try
-            {
-                exited = player.HasExited;
-            }
-            catch
-            {
-                exited = true;
-            }
-
-            if (exited)
-            {
-                // the user closed the player window; report it instead of faking progress
-                lock (_gate)
-                {
-                    _playing = false;
-                }
-
-                _window = IntPtr.Zero;
-                _protocol.SetState("TransportState", "STOPPED");
-                Log.Info("potplayer exited; transport stopped");
-                return;
-            }
+            _playing = false;
+            _window = IntPtr.Zero;
+            _protocol.SetState("TransportState", "STOPPED");
+            return;
         }
-
-        lock (_gate)
+        var hwnd = FindPlayerWindow(TimeSpan.Zero);
+        if (hwnd == IntPtr.Zero || !PotPlayerWindow.Command(hwnd, 0x5006, 0, out var status) ||
+            !PotPlayerWindow.Command(hwnd, 0x5002, 0, out var duration) || (duration <= 0 && status != 2)) return;
+        if (!_initialStateApplied)
         {
-            if (!_playing)
-            {
-                return;
-            }
-
-            _position += 1;
+            PotPlayerWindow.Command(hwnd, 0x5001, _volume, out _);
+            PotPlayerWindow.Command(hwnd, 0x5012, _muted ? 1 : 0, out _);
+            if (PotPlayerWindow.Command(hwnd, 0x5015, 0, out var currentSpeed) && currentSpeed >= 200)
+                PotPlayerWindow.Command(hwnd, 0x5016, (long)(_speed * 1000), out _);
+            _initialStateApplied = true;
         }
-
-        var text = MediaTime.FromSeconds(_position);
-        _protocol.SetState("RelativeTimePosition", text);
-        _protocol.SetState("AbsoluteTimePosition", text);
+        if (_layoutPasses > 0 && DateTime.UtcNow < _layoutDeadline &&
+            PotPlayerWindow.Command(hwnd, 0x6030, 0, out var width) && width > 0 &&
+            PotPlayerWindow.Command(hwnd, 0x6031, 0, out var height) && height > 0)
+        {
+            if (PotPlayerWindow.Apply(hwnd, (int)width, (int)height,
+                    _settings.GetInt("PlayerPosition", 2), _settings.GetInt("PlayerSize", 1),
+                    _settings.GetInt("PlayerOntop", 1) != 0)) _layoutPasses--;
+        }
+        // Do not publish a response belonging to a process replaced while querying.
+        if (!ReferenceEquals(player, _player)) return;
+        _playing = status == 2;
+        _protocol.SetState("TransportState", status switch { 1 => "PAUSED_PLAYBACK", 2 => "PLAYING", _ => "STOPPED" });
+        _protocol.SetState("CurrentTrackDuration", MediaTime.FromSeconds(duration / 1000d));
+        if (PotPlayerWindow.Command(hwnd, 0x5004, 0, out var position))
+        {
+            lock (_gate) _position = position / 1000d;
+            var text = MediaTime.FromSeconds(position / 1000d);
+            _protocol.SetState("RelativeTimePosition", text);
+            _protocol.SetState("AbsoluteTimePosition", text);
+        }
+        if (PotPlayerWindow.Command(hwnd, 0x5000, 0, out var volume) && volume is >= 0 and <= 100)
+        {
+            _volume = (int)volume;
+            _protocol.SetState("Volume", _volume);
+        }
+        if (PotPlayerWindow.Command(hwnd, 0x5011, 0, out var mute))
+        {
+            _muted = mute != 0;
+            _protocol.SetState("Mute", _muted);
+        }
     }
 
     public void SetMediaUrl(string url, string start = "0") => SetMediaUrlCore(url, start, null);
@@ -383,6 +401,11 @@ public sealed class PotPlayerRenderer : IRenderer, IAudioTrackRenderer
         SetMediaUrlCore(url, start, audioUrl);
 
     private void SetMediaUrlCore(string url, string start, string? audioUrl)
+    {
+        lock (_gate) SetMediaUrlLocked(url, start, audioUrl);
+    }
+
+    private void SetMediaUrlLocked(string url, string start, string? audioUrl)
     {
         KillPlayer();
         var startSeconds = MediaTime.ToSeconds(start);
@@ -404,6 +427,9 @@ public sealed class PotPlayerRenderer : IRenderer, IAudioTrackRenderer
         try
         {
             var info = BuildStartInfo(exe, url, startSeconds, audioUrl);
+            _initialStateApplied = false;
+            _layoutPasses = 2;
+            _layoutDeadline = DateTime.UtcNow.AddSeconds(30);
             _player = Process.Start(info);
             _playing = true;
             _protocol.SetState("TransportStatus", "OK");
@@ -413,16 +439,15 @@ public sealed class PotPlayerRenderer : IRenderer, IAudioTrackRenderer
             _window = FindPlayerWindow(WindowWait);
             if (_window == IntPtr.Zero)
             {
-                Log.Warn("potplayer window not found after launch; hotkeys will retry on demand");
+                Log.Warn("potplayer window not found after launch; commands will retry on demand");
             }
             else
             {
                 Log.Info($"potplayer window hwnd=0x{_window.ToInt64():X}");
             }
 
-            // PotPlayer restores its own volume between sessions and exposes no way to
-            // read it, so the hotkey base is unknown until the first calibration.
-            _volumeSynced = false;
+            // Loading can recreate/resize the window; apply placement once ready and
+            // confirm it on the following tick, never fight later manual window moves.
         }
         catch (Exception ex)
         {
@@ -443,16 +468,22 @@ public sealed class PotPlayerRenderer : IRenderer, IAudioTrackRenderer
             info.ArgumentList.Add("/same");
             info.ArgumentList.Add("/referer=https://www.bilibili.com/");
         }
+        info.ArgumentList.Add("/new"); // Never attach to a user's unrelated instance.
         info.ArgumentList.Add("/autoplay");
+        info.ArgumentList.Add($"/volume={_volume}");
         if (startSeconds > 0)
             info.ArgumentList.Add($"/seek={MediaTime.FromSeconds(startSeconds)}");
         var title = _settings.GetString("DLNA_FriendlyName", "Macast");
         if (!string.IsNullOrWhiteSpace(title)) info.ArgumentList.Add($"/title={title}");
-        if (File.Exists(_subtitlePath)) info.ArgumentList.Add($"/sub={_subtitlePath}");
         return info;
     }
 
     private void KillPlayer()
+    {
+        lock (_gate) KillPlayerLocked();
+    }
+
+    private void KillPlayerLocked()
     {
         var player = _player;
         _player = null;
@@ -496,156 +527,39 @@ public sealed class PotPlayerRenderer : IRenderer, IAudioTrackRenderer
         _protocol.SetState("TransportState", "STOPPED");
     }
 
+    private bool Command(int command, long value, out long result)
+    {
+        var hwnd = FindPlayerWindow(TimeSpan.Zero);
+        var ok = PotPlayerWindow.Command(hwnd, command, value, out result);
+        if (!ok && _player is not null) Log.Warn($"potplayer command 0x{command:X} failed (window missing, blocked or unresponsive)");
+        return ok;
+    }
+
     public void SetMediaPause()
     {
-        lock (_gate)
-        {
-            if (!_playing)
-            {
-                // already paused: sending space again would resume playback
-                _protocol.SetState("TransportState", "PAUSED_PLAYBACK");
-                return;
-            }
-
-            _playing = false;
-        }
-
-        if (!SendKey(' '))
-        {
-            lock (_gate)
-            {
-                _playing = true;
-            }
-
-            _protocol.SetState("TransportState", "PLAYING");
-            return;
-        }
-
+        if (!Command(0x5007, 1, out _)) return;
+        _playing = false;
         _protocol.SetState("TransportState", "PAUSED_PLAYBACK");
     }
 
     public void SetMediaResume()
     {
-        lock (_gate)
-        {
-            if (_playing)
-            {
-                _protocol.SetState("TransportState", "PLAYING");
-                return;
-            }
-
-            if (_player is null)
-            {
-                // nothing loaded; pretend nothing happened
-                _protocol.SetState("TransportState", "STOPPED");
-                return;
-            }
-
-            _playing = true;
-        }
-
-        if (!SendKey(' '))
-        {
-            lock (_gate)
-            {
-                _playing = false;
-            }
-
-            _protocol.SetState("TransportState", "PAUSED_PLAYBACK");
-            return;
-        }
-
+        if (!Command(0x5007, 2, out _)) return;
+        _playing = true;
         _protocol.SetState("TransportState", "PLAYING");
     }
 
     public void SetMediaVolume(int volume)
     {
         volume = Math.Clamp(volume, 0, 100);
-        var previous = _volume;
-
-        if (!_volumeSynced && !CalibrateVolume())
-        {
-            _volume = volume;
-            _protocol.SetState("Volume", volume);
-            Log.Warn($"volume {previous} -> {volume}: calibration failed, value reported but not applied");
-            return;
-        }
-
+        if (_player is not null && !Command(0x5001, volume, out _)) return;
         _volume = volume;
         _protocol.SetState("Volume", volume);
-
-        // PotPlayer changes volume in 5% steps with the arrow keys, so only whole
-        // steps can be applied; the remainder is carried into the next request.
-        var delta = volume - _volumeApplied + _volumeRemainder;
-        var steps = delta / 5;
-        if (steps == 0)
-        {
-            _volumeRemainder = delta;
-            Log.Debug($"volume {previous} -> {volume}: below the 5% PotPlayer step, deferred");
-            return;
-        }
-
-        _volumeRemainder = delta - steps * 5;
-        _volumeApplied = Math.Clamp(_volumeApplied + steps * 5, 0, 100);
-
-        var arrow = steps > 0 ? (char)0x26 : (char)0x28;
-        for (var i = 0; i < Math.Abs(steps); i++)
-        {
-            if (!SendKey(arrow))
-            {
-                _volumeApplied = previous;
-                _volumeRemainder = 0;
-                Log.Warn($"volume {previous} -> {volume}: PotPlayer did not accept the arrow keys");
-                return;
-            }
-
-            // PotPlayer drops one key of a burst sent back-to-back, so pace them.
-            Thread.Sleep(40);
-        }
-
-        Log.Debug($"volume {previous} -> {volume}: sent {steps} arrow step(s), applied {_volumeApplied}");
-    }
-
-    /// <summary>
-    /// PotPlayer keeps its previous session's volume and only accepts relative hotkey
-    /// changes, so the hotkey base is unknown. Press the volume down button until the
-    /// player bottoms out, which makes every later step predictable.
-    /// </summary>
-    private bool CalibrateVolume()
-    {
-        for (var i = 0; i < 24; i++)
-        {
-            if (!SendKey((char)0x28))
-            {
-                return false;
-            }
-
-            Thread.Sleep(20);
-        }
-
-        _volumeApplied = 0;
-        _volumeRemainder = 0;
-        _volumeSynced = true;
-        Log.Info("potplayer volume calibrated to 0; applying the requested level");
-        return true;
     }
 
     public void SetMediaMute(bool mute)
     {
-        if (mute == _muted)
-        {
-            // 'm' toggles; sending it again would flip the player back
-            _protocol.SetState("Mute", mute);
-            return;
-        }
-
-        if (!SendKey('m'))
-        {
-            Log.Warn($"mute {mute}: PotPlayer did not accept the 'm' key");
-            _protocol.SetState("Mute", _muted);
-            return;
-        }
-
+        if (_player is not null && !Command(0x5012, mute ? 1 : 0, out _)) return;
         _muted = mute;
         _protocol.SetState("Mute", mute);
     }
@@ -658,52 +572,27 @@ public sealed class PotPlayerRenderer : IRenderer, IAudioTrackRenderer
 
     public void SetMediaPosition(string position)
     {
-        var seconds = MediaTime.ToSeconds(position);
-        lock (_gate)
-        {
-            _position = seconds;
-        }
-
+        var seconds = Math.Max(0, MediaTime.ToSeconds(position));
+        if (!Command(0x5005, (long)(seconds * 1000), out _)) return;
+        lock (_gate) _position = seconds;
         var text = MediaTime.FromSeconds(seconds);
-        SeekViaHotkey(text);
         _protocol.SetState("RelativeTimePosition", text);
         _protocol.SetState("AbsoluteTimePosition", text);
     }
 
-    private void SeekViaHotkey(string position)
-    {
-        if (!OperatingSystem.IsWindows())
-        {
-            return;
-        }
-
-        var hwnd = FindPlayerWindow(TimeSpan.FromSeconds(3));
-        if (hwnd == IntPtr.Zero)
-        {
-            Log.Warn("potplayer window not found; seek skipped");
-            return;
-        }
-
-        if (!FocusWindow(hwnd))
-        {
-            Log.Warn("seek: could not bring the player to the foreground; the time dialog may not receive the text");
-        }
-
-        SendKey('g');
-        Thread.Sleep(250);
-        SendText(position);
-        Thread.Sleep(150);
-        SendVirtualKey(0x0D); // Enter applies the position
-        Thread.Sleep(250);
-        // PotPlayer keeps the "直接输入移动位置" dialog open after Enter; leaving it
-        // open would swallow every later hotkey (space / m / arrow).
-        SendVirtualKey(0x1B); // Esc closes it
-        Thread.Sleep(150);
-        Log.Info($"potplayer seek -> {position}");
-    }
-
     public void SetMediaSpeed(double speed)
     {
+        speed = Math.Clamp(speed, .2, 12);
+        if (_player is not null)
+        {
+            if (!Command(0x5015, 0, out var current) || current < 200)
+            {
+                Log.Warn("this PotPlayer version does not expose playback speed control");
+                return;
+            }
+            if (!Command(0x5016, (long)(speed * 1000), out _)) return;
+        }
+        _speed = speed;
         _protocol.SetState("TransportPlaySpeed", speed.ToString(System.Globalization.CultureInfo.InvariantCulture));
     }
 
@@ -715,9 +604,10 @@ public sealed class PotPlayerRenderer : IRenderer, IAudioTrackRenderer
 
     public void SetMediaSubShow(bool visible)
     {
-        // Alt+H toggles subtitles in PotPlayer (the Python advanced plugin did the same).
-        SendKeySequence(0x12, 'h');
-        _protocol.SetState("DisplayCurrentSubtitle", visible);
+        if (_protocol.GetState("DisplayCurrentSubtitle") == (visible ? "true" : "false")) return;
+        // Route Alt+H to the dedicated HWND, never through global keyboard input.
+        if (Command(0x5010, 0x0400 | 'H', out _))
+            _protocol.SetState("DisplayCurrentSubtitle", visible);
     }
 
     public void SetMediaText(string text, int durationMs = 1000)
@@ -773,7 +663,7 @@ public sealed class PotPlayerRenderer : IRenderer, IAudioTrackRenderer
         EnumWindows((hwnd, _) =>
         {
             GetWindowThreadProcessId(hwnd, out var windowPid);
-            if (windowPid == pid && IsWindowVisible(hwnd) && GetWindowTextLength(hwnd) > 0)
+            if (windowPid == pid && IsWindowVisible(hwnd) && GetWindow(hwnd, 4) == IntPtr.Zero && GetWindowTextLength(hwnd) > 0)
             {
                 found = hwnd;
                 return false;
@@ -784,244 +674,10 @@ public sealed class PotPlayerRenderer : IRenderer, IAudioTrackRenderer
         return found;
     }
 
-    private bool SendKey(char ch) => SendKeySequence(0, ch);
-
-    private bool SendKeySequence(int modifier, char ch)
-    {
-        if (!OperatingSystem.IsWindows())
-        {
-            return false;
-        }
-
-        var hwnd = FindPlayerWindow(TimeSpan.FromSeconds(3));
-        if (hwnd == IntPtr.Zero)
-        {
-            Log.Warn("potplayer window not found; hotkey dropped");
-            return false;
-        }
-
-        var focused = FocusWindow(hwnd);
-        if (focused)
-        {
-            // The key that activates a window is often swallowed by the focus
-            // transition; give the player a moment before the real key arrives.
-            Thread.Sleep(120);
-        }
-
-        var inputs = new List<Input>();
-        if (modifier != 0)
-        {
-            inputs.Add(KeyDown((ushort)modifier));
-        }
-
-        inputs.Add(KeyDown(ch));
-        inputs.Add(KeyUp(ch));
-
-        if (modifier != 0)
-        {
-            inputs.Add(KeyUp((ushort)modifier));
-        }
-
-        if (!focused)
-        {
-            // SetForegroundWindow is refused when another app owns the focus: post
-            // the key straight to the player instead of leaking it to that app.
-            Log.Debug("potplayer focus refused; posting the key to hwnd");
-            PostVirtualKey(hwnd, (ushort)char.ToUpperInvariant(ch), modifier != 0);
-            return true;
-        }
-
-        return Send(inputs) > 0;
-    }
-
-    private bool SendVirtualKey(ushort vk)
-    {
-        var hwnd = FindPlayerWindow(TimeSpan.FromSeconds(1));
-        if (hwnd != IntPtr.Zero && GetForegroundWindow() != hwnd)
-        {
-            PostVirtualKey(hwnd, vk, false);
-            return true;
-        }
-
-        return Send(new List<Input> { KeyDown(vk), KeyUp(vk) }) > 0;
-    }
-
-    private bool SendText(string text)
-    {
-        if (!OperatingSystem.IsWindows())
-        {
-            return false;
-        }
-
-        var hwnd = FindPlayerWindow(TimeSpan.FromSeconds(1));
-        if (hwnd != IntPtr.Zero && GetForegroundWindow() != hwnd)
-        {
-            // PostMessage WM_CHAR so the text lands in the time dialog even without focus.
-            foreach (var ch in text)
-            {
-                PostMessage(hwnd, 0x0102, new IntPtr(ch), new IntPtr(1));
-            }
-
-            return true;
-        }
-
-        foreach (var ch in text)
-        {
-            Send(new List<Input>
-            {
-                new()
-                {
-                    Type = 1,
-                    Union = new InputUnion { Keyboard = new KeyboardInput { Scan = ch, Flags = 0x0004 } }
-                },
-                new()
-                {
-                    Type = 1,
-                    Union = new InputUnion { Keyboard = new KeyboardInput { Scan = ch, Flags = 0x0004 | 0x0002 } }
-                }
-            });
-        }
-
-        return true;
-    }
-
-    private static void PostVirtualKey(IntPtr hwnd, ushort vk, bool withAlt)
-    {
-        try
-        {
-            PostMessage(hwnd, 0x0100, new IntPtr(vk), new IntPtr(1));
-            PostMessage(hwnd, 0x0101, new IntPtr(vk), unchecked((IntPtr)0xC0000001));
-            if (withAlt)
-            {
-                Log.Debug("modifier hotkey could not be posted; only the base key was sent");
-            }
-        }
-        catch (Exception ex)
-        {
-            Log.Debug($"post key failed: {ex.Message}");
-        }
-    }
-
-    private static Input KeyDown(char ch) => new()
-    {
-        Type = 1,
-        Union = new InputUnion { Keyboard = new KeyboardInput { VirtualKey = (ushort)char.ToUpperInvariant(ch) } }
-    };
-
-    private static Input KeyUp(char ch) => new()
-    {
-        Type = 1,
-        Union = new InputUnion { Keyboard = new KeyboardInput { VirtualKey = (ushort)char.ToUpperInvariant(ch), Flags = 0x0002 } }
-    };
-
-    private static Input KeyDown(ushort vk) => new()
-    {
-        Type = 1,
-        Union = new InputUnion { Keyboard = new KeyboardInput { VirtualKey = vk } }
-    };
-
-    private static Input KeyUp(ushort vk) => new()
-    {
-        Type = 1,
-        Union = new InputUnion { Keyboard = new KeyboardInput { VirtualKey = vk, Flags = 0x0002 } }
-    };
-
-    private static int Send(List<Input> inputs)
-    {
-        try
-        {
-            if (inputs.Count == 0)
-            {
-                return 0;
-            }
-
-            var sent = (int)SendInput((uint)inputs.Count, inputs.ToArray(), Marshal.SizeOf<Input>());
-            if (sent == 0)
-            {
-                Log.Warn($"SendInput rejected the key (size={Marshal.SizeOf<Input>()}, error={Marshal.GetLastWin32Error()})");
-            }
-
-            return sent;
-        }
-        catch (Exception ex)
-        {
-            Log.Debug($"send input failed: {ex.Message}");
-            return 0;
-        }
-    }
-
-    /// <summary>
-    /// Windows refuses SetForegroundWindow when another process owns the focus.
-    /// Attaching to the foreground thread's input queue lifts that restriction.
-    /// </summary>
-    private static bool FocusWindow(IntPtr hwnd)
-    {
-        try
-        {
-            if (GetForegroundWindow() == hwnd)
-            {
-                return true;
-            }
-
-            ShowWindow(hwnd, 9); // SW_RESTORE
-            var foreground = GetForegroundWindow();
-            var foregroundThread = GetWindowThreadProcessId(foreground, out _);
-            var currentThread = GetCurrentThreadId();
-            var attached = false;
-            if (foregroundThread != 0 && foregroundThread != currentThread)
-            {
-                attached = AttachThreadInput(currentThread, foregroundThread, true);
-            }
-
-            SetForegroundWindow(hwnd);
-            BringWindowToTop(hwnd);
-
-            if (attached)
-            {
-                AttachThreadInput(currentThread, foregroundThread, false);
-            }
-
-            Thread.Sleep(50);
-            return GetForegroundWindow() == hwnd;
-        }
-        catch (Exception ex)
-        {
-            Log.Debug($"focus window failed: {ex.Message}");
-            return false;
-        }
-    }
-
     public void Dispose()
     {
         Stop();
         _timer.Dispose();
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct Input
-    {
-        public uint Type;
-        public InputUnion Union;
-    }
-
-    // INPUT is a union whose largest member is MOUSEINPUT (32 bytes on x64), so the
-    // union must be sized explicitly: declaring only KeyboardInput makes the struct
-    // 32 bytes instead of 40 and SendInput then fails with ERROR_INVALID_PARAMETER
-    // (which looks exactly like "the hotkey did nothing").
-    [StructLayout(LayoutKind.Explicit, Size = 32)]
-    private struct InputUnion
-    {
-        [FieldOffset(0)] public KeyboardInput Keyboard;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct KeyboardInput
-    {
-        public ushort VirtualKey;
-        public ushort Scan;
-        public uint Flags;
-        public uint Time;
-        public IntPtr ExtraInfo;
     }
 
     private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
@@ -1033,32 +689,12 @@ public sealed class PotPlayerRenderer : IRenderer, IAudioTrackRenderer
     private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out int processId);
 
     [DllImport("user32.dll")]
+    private static extern IntPtr GetWindow(IntPtr hwnd, uint command);
+
+    [DllImport("user32.dll")]
     private static extern bool IsWindowVisible(IntPtr hWnd);
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     private static extern int GetWindowTextLength(IntPtr hWnd);
 
-    [DllImport("user32.dll")]
-    private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
-
-    [DllImport("user32.dll")]
-    private static extern bool SetForegroundWindow(IntPtr hWnd);
-
-    [DllImport("user32.dll")]
-    private static extern bool BringWindowToTop(IntPtr hWnd);
-
-    [DllImport("user32.dll")]
-    private static extern IntPtr GetForegroundWindow();
-
-    [DllImport("kernel32.dll")]
-    private static extern uint GetCurrentThreadId();
-
-    [DllImport("user32.dll")]
-    private static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool attach);
-
-    [DllImport("user32.dll", SetLastError = true)]
-    private static extern bool PostMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
-
-    [DllImport("user32.dll", SetLastError = true)]
-    private static extern uint SendInput(uint count, Input[] inputs, int size);
 }

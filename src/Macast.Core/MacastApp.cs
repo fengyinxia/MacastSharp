@@ -114,8 +114,9 @@ public sealed class MacastApp : IAsyncDisposable
                 {
                     new("loopback", "loopback", IPAddress.Loopback, IPAddress.Parse("255.0.0.0"), false)
                 }
-                : NetworkUtils.GetAddresses(Settings);
+                : NetworkUtils.GetAddresses();
 
+            Ssdp.AdvertiseNva = Protocol is Protocols.Nva.NvaProtocolService;
             await Ssdp.StartAsync(actualPort, Addresses, cancellationToken);
             Renderer.Start();
 
@@ -240,7 +241,7 @@ public sealed class MacastApp : IAsyncDisposable
                     {
                         new("loopback", "loopback", IPAddress.Loopback, IPAddress.Parse("255.0.0.0"), false)
                     }
-                    : NetworkUtils.GetAddresses(Settings);
+                    : NetworkUtils.GetAddresses();
 
                 var before = Addresses.Select(a => $"{a.Address}/{a.Mask}").OrderBy(x => x).ToArray();
                 var after = current.Select(a => $"{a.Address}/{a.Mask}").OrderBy(x => x).ToArray();

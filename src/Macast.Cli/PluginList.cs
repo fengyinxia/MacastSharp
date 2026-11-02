@@ -9,7 +9,7 @@ internal static class PluginList
     {
         var settings = AppSettings.Load();
         Console.WriteLine($"platform: {PlatformInfo.Current}   renderer: {settings.GetString("Macast_Renderer", PluginRegistry.DefaultRendererId)}" +
-                          $"   protocol: {settings.GetString("Macast_Protocol", PluginRegistry.DefaultProtocolId)}");
+                          $"   protocol: {PluginRegistry.ResolveProtocol(settings).Metadata.Title}");
         Console.WriteLine();
 
         Console.WriteLine("Renderers");

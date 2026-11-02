@@ -17,8 +17,8 @@ public sealed class ProtocolContext
 }
 
 /// <summary>
-/// A live protocol instance: it owns the HTTP listener (DLNA on Kestrel, NVA on
-/// its own socket server) and publishes media state to the renderer.
+/// A live protocol instance: it owns the socket listener and publishes shared
+/// DLNA/NVA media state to the renderer.
 /// </summary>
 public interface IProtocolService : IProtocolStateSink, IAsyncDisposable
 {

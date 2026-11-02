@@ -1,7 +1,6 @@
 using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
-using Macast.Core.Settings;
 
 namespace Macast.Core.Net;
 
@@ -9,10 +8,8 @@ public sealed record InterfaceAddress(string Name, string Id, IPAddress Address,
 
 public static class NetworkUtils
 {
-    public static List<InterfaceAddress> GetAddresses(AppSettings settings)
+    public static List<InterfaceAddress> GetAddresses()
     {
-        var blocked = new HashSet<string>(settings.GetStringList("Blocked_Interfaces"), StringComparer.OrdinalIgnoreCase);
-        var additional = new HashSet<string>(settings.GetStringList("Additional_Interfaces"), StringComparer.OrdinalIgnoreCase);
         var result = new List<InterfaceAddress>();
 
         foreach (var nic in NetworkInterface.GetAllNetworkInterfaces())
@@ -23,11 +20,6 @@ public static class NetworkUtils
             }
 
             if (nic.OperationalStatus != OperationalStatus.Up)
-            {
-                continue;
-            }
-
-            if (blocked.Contains(nic.Name) || blocked.Contains(nic.Id))
             {
                 continue;
             }
@@ -46,9 +38,8 @@ public static class NetworkUtils
                 g.Address.AddressFamily == AddressFamily.InterNetwork &&
                 !g.Address.Equals(IPAddress.Any));
 
-            // Mirrors the Python host: only interfaces with a default gateway are
-            // advertised, unless the user listed them in Additional_Interfaces.
-            if (!hasGateway && !additional.Contains(nic.Name) && !additional.Contains(nic.Id))
+            // Discovery always uses the default policy, ignoring legacy overrides.
+            if (!hasGateway)
             {
                 continue;
             }

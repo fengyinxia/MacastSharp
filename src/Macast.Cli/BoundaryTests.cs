@@ -6,6 +6,7 @@ using System.Text;
 using System.Text.Json;
 using Macast.Core;
 using Macast.Core.Protocols;
+using Macast.Core.Net;
 using Macast.Core.Protocols.Nva;
 using Macast.Core.Server;
 using Macast.Core.Settings;
@@ -18,6 +19,16 @@ internal static class BoundaryTests
 {
     public static async Task RunAsync(MacastApp app, HttpClient http, List<string> failures)
     {
+        await CheckAsync("default automatic network selection", () =>
+        {
+            var addresses = NetworkUtils.GetAddresses();
+            Require(addresses.Count > 0, "automatic network selection returned no addresses");
+            Require(addresses.All(a => a.Address.AddressFamily == AddressFamily.InterNetwork &&
+                (a.HasGateway || IPAddress.IsLoopback(a.Address))), "non-default interface selected");
+            Require(addresses.Select(a => a.Address).Distinct().Count() == addresses.Count, "duplicate interface addresses");
+            return Task.CompletedTask;
+        }, failures);
+
         await CheckAsync("loopback listener binding", () =>
         {
             RequireLoopback(app.Port);
@@ -116,6 +127,49 @@ internal static class BoundaryTests
             return Task.CompletedTask;
         }, failures);
 
+        await CheckAsync("log retention, daily rotation and size rotation", () =>
+        {
+            var previousFile = Log.LogFile;
+            var previousDays = Log.RetentionDays;
+            var echo = Log.Echo;
+            var directory = Path.Combine(AppSettings.ConfigDir, "log-retention-test");
+            Directory.CreateDirectory(directory);
+            try
+            {
+                Log.Echo = false;
+                var path = Path.Combine(directory, "macast-cs.log");
+                Log.LogFile = path;
+                var expired = path + ".20200101-120000000-1234abcd";
+                var recent = path + ".20260101-120000000-1234abcd";
+                var unrelated = path + ".notes";
+                foreach (var file in new[] { path, path + ".1", expired, recent, unrelated })
+                    File.WriteAllText(file, "old-entry");
+                foreach (var file in new[] { path, path + ".1", expired, unrelated })
+                    File.SetLastWriteTimeUtc(file, DateTime.UtcNow.AddDays(-10));
+                Log.ConfigureRetention(7);
+                Require(!File.Exists(path) && !File.Exists(path + ".1") && !File.Exists(expired), "expired logs not deleted");
+                Require(File.Exists(recent) && File.Exists(unrelated), "cleanup deleted recent or unrelated file");
+                Log.Info("first-entry");
+                File.SetLastWriteTime(path, DateTime.Today.AddDays(-1).AddHours(12));
+                Log.Info("daily-entry");
+                Require(File.ReadAllText(path).Contains("daily-entry") && !File.ReadAllText(path).Contains("first-entry"), "daily log not rotated");
+                using (var stream = new FileStream(path, FileMode.Open, FileAccess.Write)) stream.SetLength(5 * 1024 * 1024);
+                Log.Info("size-entry");
+                Require(new FileInfo(path).Length < 1024, "size cap not enforced");
+                Require(Directory.GetFiles(directory).Length == 5, "archives overwritten or unexpectedly deleted");
+                Log.ConfigureRetention(1);
+                Require(Log.RetentionDays == 1, "retention change ignored");
+            }
+            finally
+            {
+                Log.LogFile = previousFile;
+                Log.ConfigureRetention(previousDays);
+                Log.Echo = echo;
+                Directory.Delete(directory, recursive: true);
+            }
+            return Task.CompletedTask;
+        }, failures);
+
         await CheckAsync("GENA callback restriction", async () =>
         {
             using var subscribe = new HttpRequestMessage(new HttpMethod("SUBSCRIBE"), "/AVTransport/event");
@@ -126,7 +180,7 @@ internal static class BoundaryTests
 
         await CheckAsync("GENA subscription limit", async () =>
         {
-            var protocol = ((DlnaProtocolService)app.Protocol).Protocol;
+            var protocol = ((NvaProtocolService)app.Protocol).Protocol;
             await using var probe = new EventProbe();
             var sids = new List<string>();
             try

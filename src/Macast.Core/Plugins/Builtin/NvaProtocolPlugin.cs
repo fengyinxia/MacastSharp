@@ -14,11 +14,11 @@ public sealed class NvaProtocolPlugin : IProtocolPlugin
 
     private sealed class NvaMetadata : MacastPlugin
     {
-        public override string Id => "NVA";
+        public override string Id => "Auto";
 
-        public override string Title => "NVA Protocol";
+        public override string Title => "自动（DLNA + B站 NVA）";
 
-        public override string Description => "NVA(nirvana) 投屏协议，B 站「哔哩必连 / 云视听小电视」，支持弹幕、倍速与自动连播";
+        public override string Description => "DLNA 与 B站 NVA 同时接收，按请求自动识别，共用设备和播放器；支持高清、倍速与自动连播，不渲染弹幕。";
 
         public override string Author => "xfangfang";
 

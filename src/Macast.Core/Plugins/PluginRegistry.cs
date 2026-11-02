@@ -12,18 +12,16 @@ namespace Macast.Core.Plugins;
 public static class PluginRegistry
 {
     public const string DefaultRendererId = "MPV";
-    public const string DefaultProtocolId = "DLNA";
+    public const string DefaultProtocolId = "Auto";
 
     private static readonly IReadOnlyList<IRendererPlugin> Renderers = new IRendererPlugin[]
     {
         new MpvRendererPlugin(),
-        new PotPlayerPlugin(),
-        new LiveRendererPlugin()
+        new PotPlayerPlugin()
     };
 
     private static readonly IReadOnlyList<IProtocolPlugin> Protocols = new IProtocolPlugin[]
     {
-        new DlnaProtocolPlugin(),
         new NvaProtocolPlugin()
     };
 
@@ -50,6 +48,9 @@ public static class PluginRegistry
         }
 
         var value = idOrTitle.Trim();
+        if (value.Equals("DLNA", StringComparison.OrdinalIgnoreCase) ||
+            value.Equals("NVA", StringComparison.OrdinalIgnoreCase))
+            return Protocols[0];
         return Protocols.FirstOrDefault(p => Matches(p.Metadata, value));
     }
 
@@ -69,7 +70,7 @@ public static class PluginRegistry
         return plugin;
     }
 
-    /// <summary>Resolves Macast_Protocol; unknown ids fall back to DLNA.</summary>
+    /// <summary>Resolves the automatic service, accepting legacy DLNA/NVA ids.</summary>
     public static IProtocolPlugin ResolveProtocol(AppSettings settings)
     {
         var configured = Environment.GetEnvironmentVariable("MACAST_PROTOCOL") is { Length: > 0 } overrideId

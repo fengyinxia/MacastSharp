@@ -1,10 +1,13 @@
-using System.Diagnostics;
-using System.Net.NetworkInformation;
-using System.Net.Sockets;
 using Macast.Core;
 using Macast.Core.Plugins;
 using Macast.Core.Settings;
 using Macast.Core.Utils;
+using Button = AntdUI.Button;
+using TextBox = AntdUI.Input;
+using NumericUpDown = AntdUI.InputNumber;
+using CheckBox = AntdUI.Switch;
+using ComboBox = AntdUI.Select;
+using TabPage = AntdUI.TabPage;
 
 namespace Macast.Tray;
 
@@ -14,39 +17,33 @@ namespace Macast.Tray;
 /// calls MacastApp.RestartAsync / ReloadRendererAsync directly instead of reloading a
 /// browser tab.
 /// </summary>
-internal sealed class SettingsForm : Form
+internal sealed class SettingsForm : AntdUI.Window
 {
     private readonly MacastApp _app;
-    private readonly TextBox _nameBox = new();
-    private readonly NumericUpDown _portBox = new();
+    private readonly TextBox _nameBox = new() { Radius = 8 };
+    private readonly NumericUpDown _portBox = new() { Radius = 8 };
     private readonly CheckBox _autoStartBox = new();
-    private readonly ComboBox _protocolBox = new();
-    private readonly ComboBox _rendererBox = new();
-    private readonly ComboBox _positionBox = new();
-    private readonly ComboBox _sizeBox = new();
-    private readonly ComboBox _hwBox = new();
+    private readonly ComboBox _rendererBox = NewSelect();
+    private readonly ComboBox _positionBox = NewSelect();
+    private readonly ComboBox _sizeBox = NewSelect();
+    private readonly ComboBox _hwBox = NewSelect();
     private readonly CheckBox _ontopBox = new();
-    private readonly NumericUpDown _volumeBox = new();
-    private readonly CheckedListBox _blockedList = new();
-    private readonly CheckedListBox _additionalList = new();
-    private readonly ListBox _pluginList = new();
-    private readonly Panel _pluginDetail = new();
+    private readonly NumericUpDown _volumeBox = new() { Radius = 8 };
+    private readonly NumericUpDown _logRetentionBox = new() { Radius = 8, Minimum = 1, Maximum = 365, SuffixText = "天" };
+    private readonly TableLayoutPanel _playerOptions = CreateLayout(1);
+    private readonly Panel _windowOptions = new() { Dock = DockStyle.Top, AutoSize = true };
+    private readonly Panel _mpvOptions = new() { Dock = DockStyle.Top, AutoSize = true };
     private readonly Label _statusLabel = new();
-    private readonly Button _saveButton = new();
-    private readonly Button _applyButton = new();
+    private readonly Button _saveButton = new() { Radius = 8, Type = AntdUI.TTypeMini.Primary };
+    private readonly Button _applyButton = new() { Radius = 8 };
     private readonly Dictionary<string, Control> _pluginEditors = new(StringComparer.Ordinal);
-    private SplitContainer? _pluginSplit;
 
     private MacastPlugin? _selectedPlugin;
     private string _sourceName = string.Empty;
     private string _sourceRenderer = string.Empty;
-    private string _sourceProtocol = string.Empty;
     private int _sourcePort;
-    private string[] _sourceBlocked = Array.Empty<string>();
-    private string[] _sourceAdditional = Array.Empty<string>();
     private readonly AppSettings _pluginDraft = new();
     private string _sourcePlayerSettings = string.Empty;
-    private string _sourceProtocolSettings = string.Empty;
     private int _sourceVolume;
     private bool _sourceAutoStart;
     private bool _busy;
@@ -62,106 +59,122 @@ internal sealed class SettingsForm : Form
 
     private void BuildUi()
     {
+        SettingsTheme.Initialize();
         Text = "Macast 设置";
         StartPosition = FormStartPosition.CenterScreen;
-        MinimumSize = new Size(760, 560);
-        Size = new Size(860, 640);
-        Font = new Font("Microsoft YaHei UI", 9F);
+        MinimumSize = new Size(780, 580);
+        Size = new Size(920, 660);
+        Font = new Font("Microsoft YaHei UI", 10F);
         Icon = TrayIcon.Load();
+        BackColor = SettingsTheme.Surface;
+        ForeColor = SettingsTheme.Text;
+        FormBorderStyle = FormBorderStyle.None;
+        Resizable = true;
 
-        var tabs = new TabControl { Dock = DockStyle.Fill, Padding = new Point(12, 6) };
-        tabs.TabPages.Add(BuildGeneralTab());
-        tabs.TabPages.Add(BuildPlayerTab());
-        tabs.TabPages.Add(BuildPluginTab());
-        tabs.TabPages.Add(BuildAdvancedTab());
-        tabs.TabPages.Add(BuildAboutTab());
+        var header = new AntdUI.PageHeader
+        {
+            Text = "Macast", SubText = "设置", ShowIcon = true,
+            Dock = DockStyle.Top, Height = 56, Padding = new Padding(12, 0, 0, 0),
+            ShowButton = true, MinimizeBox = false, MaximizeBox = true,
+            DividerShow = true
+        };
+        var tabs = new AntdUI.Tabs
+        {
+            Name = "settingsTabs", Dock = DockStyle.Fill,
+            Alignment = TabAlignment.Left, ItemSize = 112, Gap = 16,
+            Padding = new Padding(16, 16, 16, 12), Fill = SettingsTheme.Accent,
+            EnableSwitch = true
+        };
+        tabs.Pages.Add(BuildGeneralTab());
+        tabs.Pages.Add(BuildPlayerTab());
+        tabs.Pages.Add(BuildAboutTab());
+        tabs.SelectedIndex = 0;
 
-        var bottom = new Panel { Dock = DockStyle.Bottom, Height = 52, Padding = new Padding(12, 10, 12, 10) };
+        var bottom = new Panel
+        {
+            Dock = DockStyle.Bottom, Height = 68,
+            Padding = new Padding(24, 12, 20, 12), BackColor = SettingsTheme.Surface
+        };
         _statusLabel.Dock = DockStyle.Fill;
         _statusLabel.TextAlign = ContentAlignment.MiddleLeft;
-        _statusLabel.ForeColor = SystemColors.GrayText;
+        _statusLabel.ForeColor = SettingsTheme.SecondaryText;
+        _statusLabel.AutoEllipsis = true;
+        _statusLabel.Font = new Font(Font.FontFamily, 9F);
 
         var buttons = new FlowLayoutPanel
         {
-            Dock = DockStyle.Right,
-            FlowDirection = FlowDirection.LeftToRight,
-            WrapContents = false,
-            AutoSize = true
+            Dock = DockStyle.Right, FlowDirection = FlowDirection.LeftToRight,
+            WrapContents = false, AutoSize = true, Margin = Padding.Empty
         };
-
         _saveButton.Text = "保存";
-        _saveButton.Width = 88;
+        _saveButton.Size = new Size(88, 42);
         _saveButton.Click += async (_, _) => await ApplyAsync(closeAfter: true);
-
         _applyButton.Text = "应用";
-        _applyButton.Width = 88;
+        _applyButton.Size = new Size(88, 42);
         _applyButton.Click += async (_, _) => await ApplyAsync(closeAfter: false);
-
-        var cancel = new Button { Text = "取消", Width = 88, DialogResult = DialogResult.Cancel };
-
-        buttons.Controls.Add(_saveButton);
-        buttons.Controls.Add(_applyButton);
+        var cancel = new Button
+        {
+            Text = "取消", Size = new Size(88, 42), Radius = 8,
+            DialogResult = DialogResult.Cancel
+        };
         buttons.Controls.Add(cancel);
-
+        buttons.Controls.Add(_applyButton);
+        buttons.Controls.Add(_saveButton);
         bottom.Controls.Add(_statusLabel);
         bottom.Controls.Add(buttons);
-
         AcceptButton = _saveButton;
         CancelButton = cancel;
-
         Controls.Add(tabs);
         Controls.Add(bottom);
+        Controls.Add(header);
     }
+
+    private static ComboBox NewSelect() => new() { List = true, Radius = 8, Height = 42 };
+
+    private static TabPage NewPage(string title) => new()
+    {
+        Text = title, Padding = new Padding(24, 20, 16, 12),
+        BackColor = SettingsTheme.Surface, ForeColor = SettingsTheme.Text, AutoScroll = true
+    };
 
     private TabPage BuildGeneralTab()
     {
-        var page = new TabPage("常规") { Padding = new Padding(16) };
-        var layout = CreateLayout(3);
-
-        AddRow(layout, "设备名", _nameBox, "DLNA 中显示的设备名称，留空则使用 Macast(计算机名)。");
-        AddRow(layout, "HTTP 端口", _portBox, "0 表示自动选择可用端口；修改后需要重启投屏服务。");
-        AddRow(layout, "投屏协议", _protocolBox, "NVA 会让本机同时以“云视听小电视”的身份出现在 B 站客户端里。");
-        AddRow(layout, "开机自启", _autoStartBox,
-            "写入 HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run；程序目录变动后重新勾选一次即可刷新路径。");
-
-        var configRow = new TableLayoutPanel { ColumnCount = 2, Dock = DockStyle.Fill, AutoSize = true };
-        configRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 70));
-        configRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 30));
-        var configBox = new TextBox { ReadOnly = true, Dock = DockStyle.Fill, Text = AppSettings.ConfigDir };
-        var openConfig = new Button { Text = "打开目录", Dock = DockStyle.Fill };
-        openConfig.Click += (_, _) => OpenFolder(AppSettings.ConfigDir);
-        configRow.Controls.Add(configBox, 0, 0);
-        configRow.Controls.Add(openConfig, 1, 0);
-        layout.Controls.Add(new Label { Text = "配置文件", AutoSize = true, Anchor = AnchorStyles.Left });
-        layout.Controls.Add(configRow);
-
+        var page = NewPage("常规");
+        var layout = CreateLayout(4);
+        AddRow(layout, "设备名", _nameBox);
+        AddRow(layout, "HTTP 端口", _portBox);
+        AddRow(layout, "开机自启", _autoStartBox);
+        AddRow(layout, "日志保留时间", _logRetentionBox);
         _portBox.Minimum = 0;
         _portBox.Maximum = 65535;
-        _nameBox.Dock = DockStyle.Fill;
-        _protocolBox.DropDownStyle = ComboBoxStyle.DropDownList;
-        _protocolBox.Dock = DockStyle.Fill;
-        _protocolBox.SelectedIndexChanged += (_, _) => UpdateStatusText();
-        _autoStartBox.Text = "登录 Windows 后自动启动 Macast";
-
         page.Controls.Add(layout);
         return page;
     }
 
     private TabPage BuildPlayerTab()
     {
-        var page = new TabPage("播放器") { Padding = new Padding(16) };
+        var page = NewPage("播放器");
         var layout = CreateLayout(3);
 
-        AddRow(layout, "渲染器", _rendererBox, "更换渲染器会重启投屏服务；窗口参数只重载播放器。");
-        AddRow(layout, "窗口位置", _positionBox, "仅 mpv 系渲染器生效。");
-        AddRow(layout, "窗口大小", _sizeBox, "仅 mpv 系渲染器生效。");
-        AddRow(layout, "硬件解码", _hwBox, "禁用可解决部分显卡的绿屏/黑屏问题。");
-        AddRow(layout, "窗口置顶", _ontopBox, "让播放窗口始终显示在最前面。");
-        AddRow(layout, "默认音量", _volumeBox, "投屏开始时应用的音量（0-100）。");
+        AddRow(layout, "播放器", _rendererBox);
+        var windowLayout = CreateLayout(3);
+        AddRow(windowLayout, "窗口位置", _positionBox);
+        AddRow(windowLayout, "窗口大小", _sizeBox);
+        AddRow(windowLayout, "窗口置顶", _ontopBox);
+        _windowOptions.Controls.Add(windowLayout);
+        var mpvLayout = CreateLayout(1);
+        AddRow(mpvLayout, "硬件解码", _hwBox);
+        _mpvOptions.Controls.Add(mpvLayout);
+        var volumeLayout = CreateLayout(1);
+        AddRow(volumeLayout, "默认音量", _volumeBox);
 
-        _rendererBox.DropDownStyle = ComboBoxStyle.DropDownList;
         _rendererBox.Dock = DockStyle.Fill;
-        _rendererBox.SelectedIndexChanged += (_, _) => UpdateStatusText();
+        _rendererBox.SelectedIndexChanged += (_, _) =>
+        {
+            CommitPluginEditors();
+            ShowPlayerOptions(_rendererBox.SelectedValue as MacastPlugin);
+            UpdateStatusText();
+        };
 
         foreach (var (text, value) in new[]
                  {
@@ -181,100 +194,28 @@ internal sealed class SettingsForm : Form
 
         foreach (var (text, value) in new[]
                  {
-                     ("禁用", 0), ("启用", 1), ("强制独占 GPU", 2)
+                     ("禁用", 0), ("启用", 1)
                  })
         {
             _hwBox.Items.Add(new ValueItem(text, value));
         }
 
-        _positionBox.DropDownStyle = ComboBoxStyle.DropDownList;
-        _sizeBox.DropDownStyle = ComboBoxStyle.DropDownList;
-        _hwBox.DropDownStyle = ComboBoxStyle.DropDownList;
 
-        _ontopBox.Text = "播放时窗口置顶";
         _volumeBox.Minimum = 0;
         _volumeBox.Maximum = 100;
         _volumeBox.Increment = 5;
 
-        page.Controls.Add(layout);
-        return page;
-    }
-
-    private TabPage BuildPluginTab()
-    {
-        var page = new TabPage("插件") { Padding = new Padding(16) };
-        var split = new SplitContainer
-        {
-            Dock = DockStyle.Fill,
-            FixedPanel = FixedPanel.Panel1
-        };
-        _pluginSplit = split;
-
-        _pluginList.Dock = DockStyle.Fill;
-        _pluginList.IntegralHeight = false;
-        _pluginList.SelectedIndexChanged += (_, _) =>
-        {
-            CommitPluginEditors();
-            ShowPluginDetail(_pluginList.SelectedItem as MacastPlugin);
-        };
-
-        _pluginDetail.Dock = DockStyle.Fill;
-        _pluginDetail.AutoScroll = true;
-
-        split.Panel1.Controls.Add(_pluginList);
-        split.Panel2.Controls.Add(_pluginDetail);
-        page.Controls.Add(split);
-        return page;
-    }
-
-    private TabPage BuildAdvancedTab()
-    {
-        var page = new TabPage("高级") { Padding = new Padding(16) };
-        var layout = new TableLayoutPanel
-        {
-            Dock = DockStyle.Fill,
-            ColumnCount = 2,
-            RowCount = 4,
-            AutoSize = true
-        };
-        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
-        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
-
-        _blockedList.Dock = DockStyle.Fill;
-        _blockedList.CheckOnClick = true;
-        _additionalList.Dock = DockStyle.Fill;
-        _additionalList.CheckOnClick = true;
-
-        layout.Controls.Add(new Label { Text = "屏蔽的网卡（不参与投屏发现）", AutoSize = true }, 0, 0);
-        layout.Controls.Add(new Label { Text = "强制启用的网卡（默认只启用带网关的网卡）", AutoSize = true }, 1, 0);
-        layout.Controls.Add(_blockedList, 0, 1);
-        layout.Controls.Add(_additionalList, 1, 1);
-
-        var buttons = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.LeftToRight, AutoSize = true };
-
-        var log = new Button { Text = "查看日志", AutoSize = true };
-        log.Click += (_, _) => ShowLog();
-        buttons.Controls.Add(log);
-
-        var restart = new Button { Text = "重启投屏服务", AutoSize = true };
-        restart.Click += async (_, _) => await RestartServiceAsync();
-        buttons.Controls.Add(restart);
-
-        var folder = new Button { Text = "打开配置目录", AutoSize = true };
-        folder.Click += (_, _) => OpenFolder(AppSettings.ConfigDir);
-        buttons.Controls.Add(folder);
-
-        layout.Controls.Add(new Label { Text = "维护", AutoSize = true }, 0, 2);
-        layout.Controls.Add(buttons, 0, 3);
-        layout.SetColumnSpan(buttons, 2);
-
+        page.Controls.Add(volumeLayout);
+        page.Controls.Add(_mpvOptions);
+        page.Controls.Add(_windowOptions);
+        page.Controls.Add(_playerOptions);
         page.Controls.Add(layout);
         return page;
     }
 
     private TabPage BuildAboutTab()
     {
-        var page = new TabPage("关于") { Padding = new Padding(16) };
+        var page = NewPage("关于");
         var layout = new TableLayoutPanel
         {
             Dock = DockStyle.Top,
@@ -302,6 +243,9 @@ internal sealed class SettingsForm : Form
             Margin = new Padding(0, 0, 0, 12)
         });
 
+        var log = new Button { Text = "查看日志", Size = new Size(112, 42), Radius = 8 };
+        log.Click += (_, _) => ShowLog();
+        layout.Controls.Add(log);
         page.Controls.Add(layout);
         return page;
     }
@@ -318,12 +262,12 @@ internal sealed class SettingsForm : Form
             AutoSizeMode = AutoSizeMode.GrowAndShrink,
             Padding = new Padding(0, 0, 0, 12)
         };
-        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 120));
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 116));
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         return layout;
     }
 
-    private static void AddRow(TableLayoutPanel layout, string label, Control control, string? help = null)
+    private static void AddRow(TableLayoutPanel layout, string label, Control control)
     {
         var row = new TableLayoutPanel
         {
@@ -332,25 +276,27 @@ internal sealed class SettingsForm : Form
             AutoSize = true,
             Margin = new Padding(0, 0, 0, 8)
         };
-        control.Dock = DockStyle.Fill;
-        row.Controls.Add(control);
-        if (!string.IsNullOrWhiteSpace(help))
+        if (control is CheckBox)
         {
-            row.Controls.Add(new Label
-            {
-                Text = help,
-                AutoSize = true,
-                ForeColor = SystemColors.GrayText,
-                Margin = new Padding(0, 2, 0, 0)
-            });
+            control.Size = new Size(48, 28);
+            control.Anchor = AnchorStyles.Left;
+            control.Margin = new Padding(4, 9, 0, 9);
         }
+        else
+        {
+            control.Dock = DockStyle.Fill;
+            control.Height = 44;
+            control.MinimumSize = new Size(0, 44);
+        }
+        row.Controls.Add(control);
 
         layout.Controls.Add(new Label
         {
             Text = label,
             AutoSize = true,
             Anchor = AnchorStyles.Left,
-            Margin = new Padding(0, 6, 8, 0)
+            ForeColor = SettingsTheme.Text,
+            Margin = new Padding(0, 8, 16, 8)
         });
         layout.Controls.Add(row);
     }
@@ -361,61 +307,34 @@ internal sealed class SettingsForm : Form
 
         _nameBox.Text = settings.GetString("DLNA_FriendlyName", settings.MachineFriendlyName);
         _portBox.Value = Math.Clamp(settings.GetInt("ApplicationPort", 0), 0, 65535);
+        _logRetentionBox.Value = Math.Clamp(settings.GetInt("LogRetentionDays", Log.DefaultRetentionDays), 1, 365);
 
         _autoStartBox.Checked = AutoStart.IsEnabled();
         _sourceAutoStart = _autoStartBox.Checked;
 
         _rendererBox.Items.Clear();
-        _protocolBox.Items.Clear();
-        _pluginList.Items.Clear();
 
         foreach (var plugin in PluginRegistry.RendererPlugins)
         {
             _rendererBox.Items.Add(plugin.Metadata);
-            _pluginList.Items.Add(plugin.Metadata);
-        }
-
-        foreach (var plugin in PluginRegistry.ProtocolPlugins)
-        {
-            _protocolBox.Items.Add(plugin.Metadata);
-            _pluginList.Items.Add(plugin.Metadata);
         }
 
         SelectByKey(_rendererBox, settings.GetString("Macast_Renderer", PluginRegistry.DefaultRendererId),
             _app.RendererPlugin.Metadata.Id);
-        SelectByKey(_protocolBox, settings.GetString("Macast_Protocol", PluginRegistry.DefaultProtocolId),
-            _app.ProtocolPlugin.Metadata.Id);
 
         SelectCombo(_positionBox, settings.GetInt("PlayerPosition", 2));
         SelectCombo(_sizeBox, settings.GetInt("PlayerSize", 1));
-        SelectCombo(_hwBox, settings.GetInt("PlayerHW", 1));
+        // The old value 2 only selected a dedicated GPU on macOS; on Windows it
+        // has always meant ordinary hardware decoding. Do not display a fake mode.
+        SelectCombo(_hwBox, Math.Clamp(settings.GetInt("PlayerHW", 1), 0, 1));
         _ontopBox.Checked = settings.GetInt("PlayerOntop", 1) != 0;
         _volumeBox.Value = Math.Clamp(settings.GetInt("PlayerDefaultVolume", 100), 0, 100);
-
-        var blocked = settings.GetStringList("Blocked_Interfaces");
-        var additional = settings.GetStringList("Additional_Interfaces");
-        _blockedList.Items.Clear();
-        _additionalList.Items.Clear();
-        foreach (var nic in EnumerateInterfaces())
-        {
-            _blockedList.Items.Add(nic, blocked.Contains(nic.Name, StringComparer.OrdinalIgnoreCase));
-            _additionalList.Items.Add(nic, additional.Contains(nic.Name, StringComparer.OrdinalIgnoreCase));
-        }
 
         _sourceName = _nameBox.Text.Trim();
         _sourcePort = settings.GetInt("ApplicationPort", 0);
         _sourceRenderer = SelectedPluginId(_rendererBox);
-        _sourceProtocol = SelectedPluginId(_protocolBox);
-        _sourceBlocked = blocked.ToArray();
-        _sourceAdditional = additional.ToArray();
-
-        if (_pluginList.Items.Count > 0)
-        {
-            _pluginList.SelectedIndex = 0;
-        }
 
         _sourcePlayerSettings = PlayerSettingsFingerprint();
-        _sourceProtocolSettings = PluginSettingsFingerprint(PluginRegistry.ProtocolPlugins.Select(p => p.Metadata));
         _sourceVolume = (int)_volumeBox.Value;
         UpdateStatusText();
     }
@@ -428,7 +347,7 @@ internal sealed class SettingsForm : Form
                 (string.Equals(metadata.Id, key, StringComparison.OrdinalIgnoreCase) ||
                  string.Equals(metadata.Title, key, StringComparison.OrdinalIgnoreCase)))
             {
-                box.SelectedItem = item;
+                box.SelectedValue = item;
                 return;
             }
         }
@@ -438,7 +357,7 @@ internal sealed class SettingsForm : Form
             if (item is MacastPlugin metadata &&
                 string.Equals(metadata.Id, fallbackKey, StringComparison.OrdinalIgnoreCase))
             {
-                box.SelectedItem = item;
+                box.SelectedValue = item;
                 return;
             }
         }
@@ -455,7 +374,7 @@ internal sealed class SettingsForm : Form
         {
             if (item is ValueItem v && v.Value == value)
             {
-                box.SelectedItem = item;
+                box.SelectedValue = item;
                 return;
             }
         }
@@ -467,113 +386,26 @@ internal sealed class SettingsForm : Form
     }
 
     private static int ComboValue(ComboBox box, int fallback) =>
-        box.SelectedItem is ValueItem item ? item.Value : fallback;
+        box.SelectedValue is ValueItem item ? item.Value : fallback;
 
     private static string SelectedPluginId(ComboBox box) =>
-        box.SelectedItem is MacastPlugin metadata ? metadata.Id : string.Empty;
+        box.SelectedValue is MacastPlugin metadata ? metadata.Id : string.Empty;
 
-    private void ShowPluginDetail(MacastPlugin? plugin)
+    private void ShowPlayerOptions(MacastPlugin? plugin)
     {
-        _pluginDetail.Controls.Clear();
+        var previous = _playerOptions.Controls.Cast<Control>().ToArray();
+        _playerOptions.Controls.Clear();
+        foreach (var control in previous) control.Dispose();
         _pluginEditors.Clear();
         _selectedPlugin = plugin;
-        if (plugin is null)
+        _mpvOptions.Visible = plugin?.Id == "MPV";
+        if (plugin is null) return;
+        foreach (var descriptor in plugin.Settings)
         {
-            return;
+            var editor = CreateEditor(descriptor);
+            _pluginEditors[descriptor.Key] = editor;
+            AddRow(_playerOptions, "程序路径", editor);
         }
-
-        var layout = new TableLayoutPanel
-        {
-            Dock = DockStyle.Top,
-            AutoSize = true,
-            ColumnCount = 2,
-            Padding = new Padding(8)
-        };
-        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 190));
-        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-
-        var header = new Label
-        {
-            Text = $"{plugin.Title}  v{plugin.Version}",
-            Font = new Font("Microsoft YaHei UI", 12F, FontStyle.Bold),
-            AutoSize = true
-        };
-        layout.Controls.Add(header);
-        layout.SetColumnSpan(header, 2);
-
-        var meta = new Label
-        {
-            Text = $"{plugin.Id} · {plugin.Author} · " +
-                   $"{(plugin.Kind == PluginKind.Renderer ? "渲染器" : "协议")} · " +
-                   $"{plugin.StatusText(_app.Settings)}",
-            AutoSize = true,
-            ForeColor = SystemColors.GrayText
-        };
-        layout.Controls.Add(meta);
-        layout.SetColumnSpan(meta, 2);
-
-        if (!string.IsNullOrWhiteSpace(plugin.Description))
-        {
-            var description = new Label
-            {
-                Text = plugin.Description,
-                AutoSize = true,
-                MaximumSize = new Size(560, 0),
-                Margin = new Padding(0, 6, 0, 10)
-            };
-            layout.Controls.Add(description);
-            layout.SetColumnSpan(description, 2);
-        }
-
-        if (plugin.Settings.Count == 0)
-        {
-            var empty = new Label
-            {
-                Text = "该插件没有可配置项。",
-                AutoSize = true,
-                ForeColor = SystemColors.GrayText
-            };
-            layout.Controls.Add(empty);
-            layout.SetColumnSpan(empty, 2);
-        }
-        else
-        {
-            foreach (var descriptor in plugin.Settings)
-            {
-                layout.Controls.Add(new Label
-                {
-                    Text = descriptor.Label,
-                    AutoSize = true,
-                    Anchor = AnchorStyles.Left,
-                    Margin = new Padding(0, 6, 8, 6)
-                });
-
-                var editor = CreateEditor(descriptor);
-                _pluginEditors[descriptor.Key] = editor;
-                var host = new TableLayoutPanel
-                {
-                    ColumnCount = 1,
-                    AutoSize = true,
-                    Dock = DockStyle.Fill
-                };
-                editor.Dock = DockStyle.Fill;
-                host.Controls.Add(editor);
-                if (!string.IsNullOrWhiteSpace(descriptor.Help))
-                {
-                    host.Controls.Add(new Label
-                    {
-                        Text = descriptor.Help,
-                        AutoSize = true,
-                        ForeColor = SystemColors.GrayText,
-                        Margin = new Padding(0, 2, 0, 0)
-                    });
-                }
-
-                layout.Controls.Add(host);
-            }
-        }
-
-        _pluginDetail.Controls.Add(layout);
     }
 
     private Control CreateEditor(PluginSettingDescriptor descriptor)
@@ -585,10 +417,9 @@ internal sealed class SettingsForm : Form
             {
                 var box = new CheckBox
                 {
-                    Text = "启用",
+                    Size = new Size(48, 28),
                     Checked = settings.GetBool(descriptor.Key,
-                        descriptor.DefaultValue is bool b && b),
-                    AutoSize = true
+                        descriptor.DefaultValue is bool b && b)
                 };
                 return box;
             }
@@ -596,6 +427,7 @@ internal sealed class SettingsForm : Form
             {
                 var box = new NumericUpDown
                 {
+                    Radius = 8,
                     Minimum = -1_000_000,
                     Maximum = 1_000_000,
                     Value = Math.Clamp(settings.GetInt(descriptor.Key,
@@ -605,18 +437,18 @@ internal sealed class SettingsForm : Form
             }
             case PluginSettingKind.Choice:
             {
-                var box = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList };
+                var box = NewSelect();
                 var current = settings.GetString(descriptor.Key, descriptor.DefaultValue?.ToString() ?? string.Empty);
                 foreach (var choice in descriptor.Choices ?? Array.Empty<PluginSettingChoice>())
                 {
                     box.Items.Add(choice);
                     if (string.Equals(choice.Value, current, StringComparison.OrdinalIgnoreCase))
                     {
-                        box.SelectedItem = choice;
+                        box.SelectedValue = choice;
                     }
                 }
 
-                if (box.SelectedItem is null && box.Items.Count > 0)
+                if (box.SelectedValue is null && box.Items.Count > 0)
                 {
                     box.SelectedIndex = 0;
                 }
@@ -631,9 +463,10 @@ internal sealed class SettingsForm : Form
                 var text = new TextBox
                 {
                     Text = settings.GetString(descriptor.Key, descriptor.DefaultValue?.ToString() ?? string.Empty),
+                    Radius = 8,
                     Dock = DockStyle.Fill
                 };
-                var browse = new Button { Text = "浏览…", Dock = DockStyle.Fill };
+                var browse = new Button { Text = "浏览…", Dock = DockStyle.Fill, Radius = 8, Height = 44 };
                 browse.Click += (_, _) => BrowseForPath(text);
                 host.Controls.Add(text, 0, 0);
                 host.Controls.Add(browse, 1, 0);
@@ -644,7 +477,8 @@ internal sealed class SettingsForm : Form
             {
                 return new TextBox
                 {
-                    Text = settings.GetString(descriptor.Key, descriptor.DefaultValue?.ToString() ?? string.Empty)
+                    Text = settings.GetString(descriptor.Key, descriptor.DefaultValue?.ToString() ?? string.Empty),
+                    Radius = 8
                 };
             }
         }
@@ -691,7 +525,7 @@ internal sealed class SettingsForm : Form
                 case NumericUpDown number:
                     _pluginDraft.Set(descriptor.Key, (int)number.Value);
                     break;
-                case ComboBox combo when combo.SelectedItem is PluginSettingChoice choice:
+                case ComboBox combo when combo.SelectedValue is PluginSettingChoice choice:
                     _pluginDraft.Set(descriptor.Key, choice.Value);
                     break;
                 case TextBox text:
@@ -701,7 +535,7 @@ internal sealed class SettingsForm : Form
                     _pluginDraft.Set(descriptor.Key, pathBox.Text.Trim());
                     break;
                 case TableLayoutPanel choiceHost when choiceHost.Tag is ComboBox choiceBox &&
-                                                        choiceBox.SelectedItem is PluginSettingChoice picked:
+                                                        choiceBox.SelectedValue is PluginSettingChoice picked:
                     _pluginDraft.Set(descriptor.Key, picked.Value);
                     break;
             }
@@ -723,8 +557,7 @@ internal sealed class SettingsForm : Form
     private bool CollectSettings()
     {
         var settings = _app.Settings;
-        var restartNeeded = _sourceProtocolSettings !=
-            PluginSettingsFingerprint(PluginRegistry.ProtocolPlugins.Select(p => p.Metadata));
+        var restartNeeded = false;
         foreach (var descriptor in PluginRegistry.RendererPlugins.Select(p => p.Metadata)
                      .Concat(PluginRegistry.ProtocolPlugins.Select(p => p.Metadata)).SelectMany(p => p.Settings))
         {
@@ -747,18 +580,17 @@ internal sealed class SettingsForm : Form
         }
 
         settings.Set("ApplicationPort", (int)_portBox.Value);
+        settings.Set("LogRetentionDays", (int)_logRetentionBox.Value);
 
         var renderer = SelectedPluginId(_rendererBox);
-        var protocol = SelectedPluginId(_protocolBox);
         if (!string.Equals(renderer, _sourceRenderer, StringComparison.OrdinalIgnoreCase) ||
-            !string.Equals(protocol, _sourceProtocol, StringComparison.OrdinalIgnoreCase) ||
             !string.Equals(name, _sourceName, StringComparison.Ordinal))
         {
             restartNeeded = true;
         }
 
         settings.Set("Macast_Renderer", renderer);
-        settings.Set("Macast_Protocol", protocol);
+        settings.Set("Macast_Protocol", PluginRegistry.DefaultProtocolId);
 
         settings.Set("PlayerPosition", ComboValue(_positionBox, 2));
         settings.Set("PlayerSize", ComboValue(_sizeBox, 1));
@@ -766,25 +598,8 @@ internal sealed class SettingsForm : Form
         settings.Set("PlayerOntop", _ontopBox.Checked ? 1 : 0);
         settings.Set("PlayerDefaultVolume", (int)_volumeBox.Value);
 
-        var blocked = _blockedList.CheckedItems.Cast<NicItem>()
-            .Select(item => item.Name)
-            .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
-            .ToArray();
-        var additional = _additionalList.CheckedItems.Cast<NicItem>()
-            .Select(item => item.Name)
-            .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
-            .ToArray();
-
-        if (!blocked.SequenceEqual(_sourceBlocked, StringComparer.OrdinalIgnoreCase) ||
-            !additional.SequenceEqual(_sourceAdditional, StringComparer.OrdinalIgnoreCase))
-        {
-            restartNeeded = true;
-        }
-
-        settings.Set("Blocked_Interfaces", blocked);
-        settings.Set("Additional_Interfaces", additional);
-
         settings.Save();
+        Log.ConfigureRetention(settings.GetInt("LogRetentionDays", Log.DefaultRetentionDays));
         return restartNeeded;
     }
 
@@ -830,14 +645,10 @@ internal sealed class SettingsForm : Form
             }
 
             _sourcePlayerSettings = PlayerSettingsFingerprint();
-            _sourceProtocolSettings = PluginSettingsFingerprint(PluginRegistry.ProtocolPlugins.Select(p => p.Metadata));
             _sourceVolume = (int)_volumeBox.Value;
             _sourceName = _nameBox.Text.Trim();
             _sourcePort = _app.Settings.GetInt("ApplicationPort", 0);
             _sourceRenderer = SelectedPluginId(_rendererBox);
-            _sourceProtocol = SelectedPluginId(_protocolBox);
-            _sourceBlocked = _app.Settings.GetStringList("Blocked_Interfaces").ToArray();
-            _sourceAdditional = _app.Settings.GetStringList("Additional_Interfaces").ToArray();
 
             if (closeAfter)
             {
@@ -866,6 +677,8 @@ internal sealed class SettingsForm : Form
     {
         _saveButton.Enabled = !busy;
         _applyButton.Enabled = !busy;
+        _saveButton.Loading = busy;
+        _applyButton.Loading = busy;
         Cursor = busy ? Cursors.WaitCursor : Cursors.Default;
     }
 
@@ -876,35 +689,8 @@ internal sealed class SettingsForm : Form
             return;
         }
 
-        var renderer = _rendererBox.SelectedItem as MacastPlugin;
-        var protocol = _protocolBox.SelectedItem as MacastPlugin;
-        _statusLabel.Text = $"{_app.Settings.FriendlyName} · {renderer?.Title ?? "-"} · {protocol?.Title ?? "-"}";
-    }
-
-    private async Task RestartServiceAsync()
-    {
-        if (_busy)
-        {
-            return;
-        }
-
-        _busy = true;
-        SetBusy(true);
-        try
-        {
-            _statusLabel.Text = "正在重启投屏服务…";
-            await _app.RestartAsync();
-            _statusLabel.Text = _app.Running ? "服务已重启：" + _app.DeviceUrl() : "服务已停止。";
-        }
-        catch (Exception ex)
-        {
-            MessageBox.Show(this, "重启失败：" + ex.Message, "Macast", MessageBoxButtons.OK, MessageBoxIcon.Error);
-        }
-        finally
-        {
-            _busy = false;
-            SetBusy(false);
-        }
+        var renderer = _rendererBox.SelectedValue as MacastPlugin;
+        _statusLabel.Text = $"{_app.Settings.FriendlyName} · {renderer?.Title ?? "-"}";
     }
 
     private void ShowLog()
@@ -922,7 +708,7 @@ internal sealed class SettingsForm : Form
             Size = new Size(900, 600),
             StartPosition = FormStartPosition.CenterParent
         };
-        var box = new TextBox
+        var box = new System.Windows.Forms.TextBox
         {
             Multiline = true,
             ReadOnly = true,
@@ -947,69 +733,6 @@ internal sealed class SettingsForm : Form
 
         viewer.Controls.Add(box);
         viewer.ShowDialog(this);
-    }
-
-    private static void OpenFolder(string path)
-    {
-        try
-        {
-            Directory.CreateDirectory(path);
-            Process.Start(new ProcessStartInfo("explorer.exe", $"\"{path}\"") { UseShellExecute = true });
-        }
-        catch (Exception ex)
-        {
-            Log.Error($"open folder failed: {ex.Message}");
-        }
-    }
-
-    private static IEnumerable<NicItem> EnumerateInterfaces()
-    {
-        var list = new List<NicItem>();
-        foreach (var nic in NetworkInterface.GetAllNetworkInterfaces())
-        {
-            if (nic.NetworkInterfaceType == NetworkInterfaceType.Loopback ||
-                nic.OperationalStatus != OperationalStatus.Up)
-            {
-                continue;
-            }
-
-            string address = string.Empty;
-            try
-            {
-                address = string.Join(",", nic.GetIPProperties().UnicastAddresses
-                    .Where(a => a.Address.AddressFamily == AddressFamily.InterNetwork)
-                    .Select(a => a.Address.ToString()));
-            }
-            catch
-            {
-                // ignore inaccessible adapters
-            }
-
-            list.Add(new NicItem(nic.Name, string.IsNullOrEmpty(address) ? nic.Name : $"{nic.Name} ({address})"));
-        }
-
-        return list;
-    }
-
-    protected override void OnShown(EventArgs e)
-    {
-        base.OnShown(e);
-        if (_pluginSplit is not null)
-        {
-            try
-            {
-                _pluginSplit.SplitterDistance = 260;
-            }
-            catch (InvalidOperationException)
-            {
-                // window too narrow during first layout; the default distance is fine
-            }
-        }
-    }
-
-    private sealed record NicItem(string Name, string Label)
-    {
-        public override string ToString() => Label;
     }
 
     private sealed record ValueItem(string Text, int Value)

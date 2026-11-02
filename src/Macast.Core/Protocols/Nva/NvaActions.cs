@@ -26,22 +26,13 @@ public sealed class NvaActions
     private readonly NvaProtocolService _service;
     private readonly Dictionary<string, string> _stateDefaults;
 
-    // nirvana.py answers GetAppInfo with Setting.get(SignedIn, False): a device without a
-    // stored access key must NOT claim to be signed in, otherwise the client skips the
-    // login flow and playurl silently degrades.
-    private bool _danmakuSwitch = true;
-
     public NvaActions(NvaProtocolService service)
     {
         _service = service;
         _stateDefaults = LoadStateDefaults();
-        _danmakuSwitch = NvaJson.ParseBool(StateDefault("DanmakuSwitch"), true);
     }
 
     public string SCPath => Path.Combine(AssetPaths.XmlDir, "NirvanaControl.xml");
-
-    /// <summary>Last SetDanmakuSwitch value (also used by GetAppInfo consumers).</summary>
-    public bool DanmakuSwitch => _danmakuSwitch;
 
     private static Dictionary<string, string> LoadStateDefaults()
     {
@@ -121,10 +112,10 @@ public sealed class NvaActions
             "GetAppInfo" => GetAppInfo(),
             "LoginWithCode" => await LoginWithCodeAsync(parameters, cancellationToken),
             "PrepareForMirrorProjection" => PrepareForMirrorProjection(),
-            "SetDanmakuSwitch" => SetDanmakuSwitch(parameters),
-            "AppendDanmaku" => AppendDanmaku(parameters),
+            // Legacy actions remain callable, but danmaku rendering has been removed.
+            "SetDanmakuSwitch" or "AppendDanmaku" => Empty(),
             "GetPlayInfo" => GetPlayInfo(),
-            "GetDanmaku" => GetDanmaku(),
+            "GetDanmaku" => new Dictionary<string, string> { ["Content"] = string.Empty },
             "GetAccountInfo" => await GetAccountInfoAsync(cancellationToken),
             "SwitchQuality" => await SwitchQualityAsync(parameters, cancellationToken),
             _ => throw new InvalidDataException($"unknown action: {ServiceName}/{actionName}")
@@ -191,31 +182,6 @@ public sealed class NvaActions
         };
     }
 
-    private Dictionary<string, string> SetDanmakuSwitch(IReadOnlyDictionary<string, string> parameters)
-    {
-        var desired = parameters.TryGetValue("DesiredSwitch", out var raw) && NvaJson.ParseBool(raw);
-        _danmakuSwitch = desired;
-        _service.SetState("DisplayCurrentSubtitle", desired ? "true" : "false");
-        _service.Renderer?.SetMediaSubShow(desired);
-        Log.Info($"NVA SetDanmakuSwitch: {desired}");
-        return Empty();
-    }
-
-    private Dictionary<string, string> AppendDanmaku(IReadOnlyDictionary<string, string> parameters)
-    {
-        var content = parameters.TryGetValue("Content", out var value) ? value : string.Empty;
-        var size = parameters.TryGetValue("Size", out var sizeText) ? sizeText : "0";
-        var type = parameters.TryGetValue("Type", out var typeText) ? typeText : "0";
-        var color = parameters.TryGetValue("Color", out var colorText) ? colorText : "0";
-        var danmakuId = parameters.TryGetValue("DanmakuId", out var idText) ? idText : string.Empty;
-        var action = parameters.TryGetValue("Action", out var actionText) ? actionText : string.Empty;
-
-        // todo: 1.发送弹幕，2.通过附加字幕实现实时显示（与 python 版 SendDanmaku 一致，暂不支持）
-        Log.Debug($"NVA AppendDanmaku: size={size} type={type} color={color} id={danmakuId} action={action}");
-        _service.Renderer?.SetMediaText($"暂未支持弹幕：{content}", 4000);
-        return Empty();
-    }
-
     private Dictionary<string, string> GetPlayInfo()
     {
         // The phone deserialises this into LinkPlayInfoTotal (playState/position/
@@ -230,17 +196,6 @@ public sealed class NvaActions
         return new Dictionary<string, string>(StringComparer.Ordinal)
         {
             ["Content"] = info.ToJsonString()
-        };
-    }
-
-    private Dictionary<string, string> GetDanmaku()
-    {
-        // 不在 NVA_SERVICE 里：python 版没有这个 action，这里返回上次生成的弹幕文件路径。
-        Log.Warn("NVA GetDanmaku: nirvana.py 0.33 does not declare this action; returning the local danmaku file");
-        var path = Path.Combine(AppSettings.ConfigDir, "macast.ass");
-        return new Dictionary<string, string>(StringComparer.Ordinal)
-        {
-            ["Content"] = File.Exists(path) ? path : string.Empty
         };
     }
 

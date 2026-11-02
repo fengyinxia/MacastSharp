@@ -1,6 +1,5 @@
 using System.Diagnostics;
 using Macast.Core;
-using Macast.Core.Renderer;
 using Macast.Core.Settings;
 using Macast.Core.Utils;
 
@@ -13,7 +12,7 @@ internal sealed class TrayApp : IDisposable
     private readonly ToolStripMenuItem _statusItem;
     private readonly ToolStripMenuItem _toggleItem;
     private readonly ToolStripMenuItem _settingsItem;
-    private readonly ToolStripMenuItem _liveItem;
+    private readonly ToolStripMenuItem _restartItem;
     private MacastApp? _app;
     private bool _busy;
 
@@ -30,7 +29,7 @@ internal sealed class TrayApp : IDisposable
         _statusItem = new ToolStripMenuItem("正在启动...") { Enabled = false };
         _toggleItem = new ToolStripMenuItem("停止投屏", null, async (_, _) => await ToggleAsync());
         _settingsItem = new ToolStripMenuItem("设置", null, (_, _) => OpenSettings());
-        _liveItem = new ToolStripMenuItem("直播频道");
+        _restartItem = new ToolStripMenuItem("重启投屏服务", null, async (_, _) => await RestartAsync());
         var configItem = new ToolStripMenuItem("打开配置目录", null, (_, _) => OpenFolder(AppSettings.ConfigDir));
         var exitItem = new ToolStripMenuItem("退出", null, async (_, _) => await ExitAsync());
 
@@ -38,11 +37,10 @@ internal sealed class TrayApp : IDisposable
         _menu.Items.Add(new ToolStripSeparator());
         _menu.Items.Add(_toggleItem);
         _menu.Items.Add(_settingsItem);
-        _menu.Items.Add(_liveItem);
+        _menu.Items.Add(_restartItem);
         _menu.Items.Add(configItem);
         _menu.Items.Add(new ToolStripSeparator());
         _menu.Items.Add(exitItem);
-        _menu.Opening += (_, _) => RefreshLiveMenu();
         _icon.ContextMenuStrip = _menu;
         _icon.DoubleClick += (_, _) => OpenSettings();
 
@@ -132,6 +130,7 @@ internal sealed class TrayApp : IDisposable
 
     private void UpdateState()
     {
+        _restartItem.Enabled = !_busy && _app is not null;
         if (_app is { Running: true })
         {
             _statusItem.Text = $"{_app.Settings.FriendlyName}  {_app.DeviceUrl()}";
@@ -160,62 +159,26 @@ internal sealed class TrayApp : IDisposable
         UpdateState();
     }
 
-    private void RefreshLiveMenu()
+    private async Task RestartAsync()
     {
-        _liveItem.DropDownItems.Clear();
-        if (_app?.Renderer is not IChannelListProvider provider)
-        {
-            _liveItem.Enabled = false;
-            _liveItem.DropDownItems.Add(new ToolStripMenuItem("当前渲染器不是 Live Renderer")
-            {
-                Enabled = false
-            });
-            return;
-        }
-
-        _liveItem.Enabled = true;
-        if (provider.Channels.Count == 0)
-        {
-            _liveItem.DropDownItems.Add(new ToolStripMenuItem("（列表为空，请刷新）") { Enabled = false });
-        }
-        else
-        {
-            foreach (var channel in provider.Channels.Take(40))
-            {
-                var item = new ToolStripMenuItem(channel.Name, null, (_, _) => PlayChannel(provider, channel));
-                _liveItem.DropDownItems.Add(item);
-            }
-        }
-
-        _liveItem.DropDownItems.Add(new ToolStripSeparator());
-        _liveItem.DropDownItems.Add(new ToolStripMenuItem("刷新列表", null, async (_, _) => await RefreshChannelsAsync(provider)));
-    }
-
-    private void PlayChannel(IChannelListProvider provider, RendererChannel channel)
-    {
+        if (_busy || _app is null) return;
+        _busy = true;
+        _restartItem.Enabled = _toggleItem.Enabled = _settingsItem.Enabled = false;
         try
         {
-            provider.Play(channel);
-            _app?.Protocol.SetState("TransportState", "PLAYING");
-            _icon.ShowBalloonTip(1500, "Macast", "正在播放：" + channel.Name, ToolTipIcon.Info);
+            await _app.RestartAsync();
+            _icon.ShowBalloonTip(1500, "Macast", "投屏服务已重启", ToolTipIcon.Info);
         }
         catch (Exception ex)
         {
-            Log.Error($"play channel failed: {ex.Message}");
-            _icon.ShowBalloonTip(3000, "Macast", ex.Message, ToolTipIcon.Error);
+            Log.Error($"restart failed: {ex}");
+            _icon.ShowBalloonTip(3000, "Macast", "重启失败：" + ex.Message, ToolTipIcon.Error);
         }
-    }
-
-    private async Task RefreshChannelsAsync(IChannelListProvider provider)
-    {
-        try
+        finally
         {
-            var count = await provider.RefreshAsync();
-            _icon.ShowBalloonTip(1500, "Macast", $"已更新直播列表：{count} 个频道", ToolTipIcon.Info);
-        }
-        catch (Exception ex)
-        {
-            _icon.ShowBalloonTip(3000, "Macast", "刷新失败：" + ex.Message, ToolTipIcon.Error);
+            _busy = false;
+            _toggleItem.Enabled = true;
+            UpdateState();
         }
     }
 

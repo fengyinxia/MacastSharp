@@ -59,20 +59,29 @@ internal static class SelfTest
 
             await CheckAsync("plugin registry", () =>
             {
-                Require(PluginRegistry.RendererPlugins.Count == 3,
-                    "expected exactly 3 renderer plugins (MPV, PotPlayer, Live)");
-                Require(PluginRegistry.ProtocolPlugins.Count == 2, "expected 2 protocol plugins");
+                Require(PluginRegistry.RendererPlugins.Count == 2,
+                    "expected exactly 2 renderer plugins (MPV, PotPlayer)");
+                Require(PluginRegistry.ProtocolPlugins.Count == 1, "expected one automatic protocol service");
                 Require(PluginRegistry.FindRenderer("MPV") is not null, "MPV plugin missing");
                 Require(PluginRegistry.FindRenderer("PotPlayer") is not null, "PotPlayer plugin missing");
-                Require(PluginRegistry.FindRenderer("Live") is not null, "Live plugin missing");
+                Require(PluginRegistry.FindRenderer("Live") is null, "Live plugin should be removed");
+                var legacyLive = new AppSettings();
+                legacyLive.Set("Macast_Renderer", "Live");
+                Require(PluginRegistry.ResolveRenderer(legacyLive).Metadata.Id == "MPV", "legacy Live config should fall back to MPV");
                 Require(PluginRegistry.FindRenderer("IINA") is null, "IINA plugin should be removed");
                 Require(PluginRegistry.FindRenderer("Web") is null, "Web plugin should be removed");
                 Require(PluginRegistry.FindRenderer("PIFM") is null, "PIFMRDS plugin should be removed");
                 Require(PluginRegistry.FindProtocol("NVA") is not null, "NVA protocol plugin missing");
                 Require(PluginRegistry.ResolveRenderer(AppSettings.Load()).Metadata.Id == "MPV",
                     "default renderer should be MPV");
-                Require(PluginRegistry.ResolveProtocol(AppSettings.Load()).Metadata.Id == "DLNA",
-                    "default protocol should be DLNA");
+                Require(PluginRegistry.ResolveProtocol(AppSettings.Load()).Metadata.Id == "Auto",
+                    "default protocol should be automatic");
+                foreach (var legacy in new[] { "DLNA", "NVA", "Auto" })
+                {
+                    var settings = new AppSettings();
+                    settings.Set("Macast_Protocol", legacy);
+                    Require(PluginRegistry.ResolveProtocol(settings).Metadata.Id == "Auto", "legacy protocol not mapped: " + legacy);
+                }
 
                 var potPlayer = PluginRegistry.FindRenderer("PotPlayer")!.Metadata;
                 Require(potPlayer.Platforms.Contains("win32"), "PotPlayer should declare win32");
@@ -265,8 +274,8 @@ internal static class SelfTest
                     var settings = AppSettings.Load();
                     Require(PluginRegistry.ResolveRenderer(settings).Metadata.Id == "PotPlayer",
                         "MACAST_RENDERER override ignored");
-                    Require(PluginRegistry.ResolveProtocol(settings).Metadata.Id == "DLNA",
-                        "MACAST_PROTOCOL override ignored");
+                    Require(PluginRegistry.ResolveProtocol(settings).Metadata.Id == "Auto",
+                        "legacy MACAST_PROTOCOL should resolve to automatic mode");
                 }
                 finally
                 {
@@ -331,6 +340,26 @@ internal static class SelfTest
                 finally
                 {
                     await service.DisposeAsync();
+                }
+            }, failures);
+
+            await CheckAsync("NVA SSDP service discovery", async () =>
+            {
+                using var portProbe = new UdpClient(new IPEndPoint(IPAddress.Loopback, 0));
+                var port = ((IPEndPoint)portProbe.Client.LocalEndPoint!).Port;
+                portProbe.Dispose();
+                await using var ssdp = new Macast.Core.Ssdp.SsdpServer(new AppSettings(), port)
+                { AdvertiseNva = true };
+                await ssdp.StartAsync(12345, new[]
+                { new Macast.Core.Net.InterfaceAddress("loopback", "loopback", IPAddress.Loopback, IPAddress.Parse("255.0.0.0"), false) });
+                foreach (var target in new[] { "urn:app-bilibili-com:service:NirvanaControl:3", "urn:app-bilibili-com:service:NirvanaControl:*" })
+                {
+                    using var udp = new UdpClient(new IPEndPoint(IPAddress.Loopback, 0));
+                    var request = $"M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nMX: 1\r\nST: {target}\r\n\r\n";
+                    await udp.SendAsync(Encoding.UTF8.GetBytes(request), new IPEndPoint(IPAddress.Loopback, ssdp.SsdpPort));
+                    var receive = await udp.ReceiveAsync().WaitAsync(TimeSpan.FromSeconds(3));
+                    var response = Encoding.UTF8.GetString(receive.Buffer);
+                    Require(response.Contains("ST: urn:app-bilibili-com:service:NirvanaControl:3\r\n", StringComparison.Ordinal), "NVA SSDP service missing");
                 }
             }, failures);
 

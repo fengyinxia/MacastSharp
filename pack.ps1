@@ -33,9 +33,10 @@ try {
 
     Copy-Item (Join-Path $root 'src\Macast.Core\Assets\*') (Join-Path $stage 'Assets') -Recurse -Force
     Copy-Item (Join-Path $root 'LICENSE') (Join-Path $stage 'LICENSE')
+    Copy-Item (Join-Path $root 'licenses') (Join-Path $stage 'licenses') -Recurse -Force
     Copy-Item (Join-Path $root 'README.md') (Join-Path $stage 'README.md')
 
-    foreach ($file in @('macast-gui.exe', 'LICENSE', 'Assets\icon.ico',
+    foreach ($file in @('macast-gui.exe', 'LICENSE', 'licenses/AntdUI-LICENSE.txt', 'Assets\icon.ico',
         'Assets\xml\Description.xml', 'Assets\xml\AVTransport.xml',
         'Assets\xml\RenderingControl.xml', 'Assets\xml\ConnectionManager.xml', 'Assets\xml\NirvanaControl.xml')) {
         if (-not (Test-Path -LiteralPath (Join-Path $stage $file) -PathType Leaf)) {

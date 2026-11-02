@@ -24,8 +24,8 @@ if (rawArgs.Contains("--help") || rawArgs.Contains("-h"))
           --plugins      list the C# plugins and their availability
           --potplayer    real-machine PotPlayer check (play/pause/mute/seek + screenshots)
           --probe-playurl  resolve a bilibili playurl (see --help in PlayUrlProbe.cs)
-          --renderer ID  override Macast_Renderer for this run (MPV, PotPlayer, Live)
-          --protocol ID  override Macast_Protocol for this run (DLNA, NVA)
+          --renderer ID  override Macast_Renderer for this run (MPV, PotPlayer)
+          --protocol ID  automatic DLNA + NVA (Auto; legacy DLNA/NVA accepted)
           --help         show this help
         """);
     return 0;
@@ -52,6 +52,7 @@ if (rawArgs.Contains("--probe-playurl"))
 }
 
 Log.LogFile = Path.Combine(AppSettings.ConfigDir, "macast-cs.log");
+Log.ConfigureRetention(AppSettings.Load().GetInt("LogRetentionDays", Log.DefaultRetentionDays));
 Log.Info($"Macast C# starting, version {AssetPaths.Version}");
 
 int? port = null;

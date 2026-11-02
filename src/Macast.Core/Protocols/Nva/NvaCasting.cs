@@ -121,7 +121,8 @@ public sealed class NvaCasting : IAsyncDisposable
     public const int DefaultDesireQn = 80;
 
     private readonly INvaCastingHost _host;
-    internal NvaPlaybackState Playback { get; } = new();
+    internal NvaPlaybackState Playback { get; private set; } = new();
+    internal bool IsNvaPlayback { get; private set; }
     internal SemaphoreSlim Commands { get; } = new(1, 1);
     private CancellationTokenSource? _extraCts;
     private Task _extraTask = Task.CompletedTask;
@@ -324,6 +325,23 @@ public sealed class NvaCasting : IAsyncDisposable
         _lastPosition = _lastDuration = string.Empty;
     }
 
+    // Caller holds Commands. Do not await _nextTask here: it may be waiting for that lock.
+    internal async Task ReleasePlaybackAsync()
+    {
+        IsNvaPlayback = false;
+        _backgroundCts.Cancel();
+        await CancelExtraInfoAsync();
+        _backgroundCts.Dispose();
+        _backgroundCts = new CancellationTokenSource();
+        Playback = new NvaPlaybackState();
+        _playList.Clear();
+        _playIndex = 0;
+        _mediaPlaying = false;
+        _lastPosition = _lastDuration = string.Empty;
+    }
+
+    internal void ActivatePlayback() => IsNvaPlayback = true;
+
     public void DisconnectAll()
     {
         foreach (var client in Snapshot())
@@ -392,6 +410,7 @@ public sealed class NvaCasting : IAsyncDisposable
     /// </summary>
     public void OnStateChanged(string name, string value)
     {
+        if (!IsNvaPlayback) return;
         switch (name)
         {
             case "RelativeTimePosition":
@@ -440,11 +459,6 @@ public sealed class NvaCasting : IAsyncDisposable
             case "TransportPlaySpeed":
                 Playback.Speed = ParseDouble(value, 1);
                 BroadcastAsync("SpeedChanged", SpeedPayload(ParseDouble(value, 1)));
-                break;
-
-            case "DisplayCurrentSubtitle":
-                Playback.DanmakuOpen = NvaJson.ParseBool(value, true);
-                BroadcastAsync("OnDanmakuSwitch", new JsonObject { ["open"] = NvaJson.ParseBool(value, true) });
                 break;
 
             case "Volume" when EmitExtendedEvents:
@@ -525,18 +539,16 @@ public sealed class NvaCasting : IAsyncDisposable
         catch (OperationCanceledException) { return; }
         try
         {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!IsNvaPlayback) return;
             await CancelExtraInfoAsync();
             _playIndex++;
             if (_playIndex < _playList.Count)
             {
                 var next = _playList[_playIndex];
                 Log.Info($"准备播放 分集{_playIndex + 1} {next.Title}");
-                var client = Snapshot().FirstOrDefault(c => !c.Terminated);
-                if (client is null)
-                {
-                    Log.Error("客户端断开连接，播放结束");
-                    return;
-                }
+                var client = Snapshot().FirstOrDefault(c => !c.Terminated)
+                    ?? new NvaClient(this, string.Empty, string.Empty);
 
                 client.ApplyPlayItem(next);
                 var resolved = await client.ResolvePlayUrlAsync(cancellationToken);
@@ -568,15 +580,14 @@ public sealed class NvaCasting : IAsyncDisposable
 
     public async Task<bool> ApplyQualityAsync(int qn, CancellationToken cancellationToken)
     {
-        var client = Snapshot().FirstOrDefault(c => !c.Terminated);
-        if (client is null)
-        {
-            Log.Warn("SwitchQuality: no NVA client connected");
-            return false;
-        }
-
         await Commands.WaitAsync(cancellationToken);
-        try { return await client.SwitchQualityAsync(qn, cancellationToken); }
+        try
+        {
+            if (!IsNvaPlayback) return false;
+            var client = Snapshot().FirstOrDefault(c => !c.Terminated)
+                ?? new NvaClient(this, string.Empty, string.Empty);
+            return await client.SwitchQualityAsync(qn, cancellationToken);
+        }
         finally { Commands.Release(); }
     }
 
@@ -690,7 +701,6 @@ public sealed class NvaClient
     private ref int _playUrlType => ref _manager.Playback.PlayUrlType;
     private ref int _contentType => ref _manager.Playback.ContentType;
     private ref bool _isPortrait => ref _manager.Playback.IsPortrait;
-    private ref bool _danmakuSwitchSave => ref _manager.Playback.DanmakuOpen;
     private ref double _desireSpeed => ref _manager.Playback.Speed;
     private ref JsonObject _qn => ref _manager.Playback.Qn;
 
@@ -1031,6 +1041,11 @@ public sealed class NvaClient
     {
         Log.Info($"CMD{counter} method:{method}");
         var renderer = Host.Renderer;
+        if (!_manager.IsNvaPlayback && method is "Pause" or "Resume" or "Stop" or "Seek" or "SwitchSpeed" or "SwitchQn")
+        {
+            await SendResponseAsync(counter, null, cancellationToken);
+            return;
+        }
 
         switch (method)
         {
@@ -1063,20 +1078,12 @@ public sealed class NvaClient
                 break;
 
             case "SendDanmaku":
-                // todo: 发送弹幕 / 通过附加字幕实现实时显示（与 python 版一致，暂不支持）
                 await SendResponseAsync(counter, null, cancellationToken);
-                renderer?.SetMediaText($"暂未支持弹幕：{NvaJson.GetString(parameters?["content"])}", 4000);
                 break;
 
             case "SwitchDanmaku":
                 await SendResponseAsync(counter, null, cancellationToken);
-                var danmakuOpen = NvaJson.GetBool(parameters?["open"], true);
-                _danmakuSwitchSave = danmakuOpen;
-                // SetState also broadcasts OnDanmakuSwitch (NvaProtocolService.OnStateChanged),
-                // so the phone's toggle stays in sync.
-                Host.SetState("DisplayCurrentSubtitle", danmakuOpen ? "true" : "false");
-                renderer?.SetMediaSubShow(danmakuOpen);
-                Log.Info($"NVA SwitchDanmaku: {danmakuOpen}");
+                await _manager.BroadcastAsync("OnDanmakuSwitch", new JsonObject { ["open"] = false }, cancellationToken);
                 break;
 
             case "SwitchSpeed":
@@ -1137,8 +1144,7 @@ public sealed class NvaClient
             return;
         }
 
-        await _manager.CancelExtraInfoAsync();
-        _manager.SetPlayList(Array.Empty<NvaPlayItem>(), 0);
+        await _manager.ReleasePlaybackAsync();
         _titleP = string.Empty;
         _aid = aid;
         _oid = NvaJson.GetString(parameters?["oid"], _aid);
@@ -1151,7 +1157,6 @@ public sealed class NvaClient
         _contentType = NvaJson.GetInt(parameters?["contentType"], 1);
         _seasonId = NvaJson.GetInt(parameters?["seasonId"]);
         _playUrlType = 1;
-        _danmakuSwitchSave = NvaJson.GetBool(parameters?["danmakuSwitchSave"], true);
         _desireSpeed = NvaJson.GetDouble(parameters?["userDesireSpeed"], 1);
         _title = string.Empty;
 
@@ -1179,7 +1184,7 @@ public sealed class NvaClient
             resolved.AudioUrl, resolved.Segments);
     }
 
-    private async Task HandlePlayUrlAsync(int counter, JsonNode? parameters, CancellationToken cancellationToken)
+    internal async Task HandlePlayUrlAsync(int counter, JsonNode? parameters, CancellationToken cancellationToken)
     {
         await SendResponseAsync(counter, null, cancellationToken);
 
@@ -1198,8 +1203,7 @@ public sealed class NvaClient
             Log.Warn("NVA PlayUrl: missing video content");
             return;
         }
-        await _manager.CancelExtraInfoAsync();
-        _manager.SetPlayList(Array.Empty<NvaPlayItem>(), 0);
+        await _manager.ReleasePlaybackAsync();
         _roomId = "0";
         _titleP = string.Empty;
         _title = NvaJson.GetString(parameters?["title"]);
@@ -1246,7 +1250,6 @@ public sealed class NvaClient
         }
 
         _desireSpeed = NvaJson.GetDouble(content?["userDesireSpeed"], 1);
-        _danmakuSwitchSave = NvaJson.GetBool(content?["danmakuSwitchSave"], true);
 
         if (_epid != 0)
         {
@@ -1306,7 +1309,7 @@ public sealed class NvaClient
             OgvAid = _aid,
             DesireQn = _desireQn,
             PlayUrlType = _playUrlType,
-            // MPV/Live and PotPlayer can play DASH video with its separate audio.
+            // MPV and PotPlayer can play DASH video with its separate audio.
             PreferDash = Host.Renderer is IAudioTrackRenderer
         };
 
@@ -1318,7 +1321,7 @@ public sealed class NvaClient
 
         if (result.Segments is { Count: > 1 } && Host.Renderer is not ISegmentedRenderer)
         {
-            Log.Warn("NVA: this video has multiple segments; select MPV or Live to play the complete video");
+            Log.Warn("NVA: this video has multiple segments; select MPV to play the complete video");
             Host.SetState("TransportStatus", "ERROR_OCCURRED");
             return null;
         }
@@ -1330,6 +1333,8 @@ public sealed class NvaClient
     public async Task SendPlayCmdAsync(string url, string start, CancellationToken cancellationToken,
         string? audioUrl = null, IReadOnlyList<MediaSegment>? segments = null)
     {
+        _manager.ActivatePlayback();
+        Host.SetState("CurrentTrackMetaData", string.Empty);
         Host.SetState("CurrentTrackURI", url);
 
         var renderer = Host.Renderer;
@@ -1357,12 +1362,8 @@ public sealed class NvaClient
 
     public async Task UpdatePlayStateAsync(CancellationToken cancellationToken)
     {
-        // Both SOAP and control-channel switches update the shared preference.
-        var danmakuOpen = _danmakuSwitchSave;
-
-        Host.SetState("DisplayCurrentSubtitle", danmakuOpen ? "true" : "false");
-        Host.Renderer?.SetMediaSubShow(danmakuOpen);
-        await _manager.BroadcastAsync("OnDanmakuSwitch", new JsonObject { ["open"] = danmakuOpen },
+        // Keep the wire response compatible without controlling the player's subtitles.
+        await _manager.BroadcastAsync("OnDanmakuSwitch", new JsonObject { ["open"] = false },
             cancellationToken);
 
         await _manager.BroadcastAsync("OnEpisodeSwitch", new JsonObject
@@ -1398,8 +1399,6 @@ public sealed class NvaClient
         var seasonId = _seasonId;
         var epid = _epid;
         var contentType = _contentType;
-        var subtitlePath = Path.Combine(AppSettings.ConfigDir, "macast.ass");
-        var pendingPath = subtitlePath + "." + Guid.NewGuid().ToString("N") + ".tmp";
         try
         {
             // 直播暂不获取额外的信息
@@ -1410,14 +1409,6 @@ public sealed class NvaClient
             }
 
             Log.Info("NVA: start get_extra_info");
-            var downloaded = await Host.Bilibili.DownloadDanmakuAsync(cid, pendingPath, cancellationToken);
-            cancellationToken.ThrowIfCancellationRequested();
-            if (downloaded is not null)
-            {
-                File.Move(downloaded, subtitlePath, overwrite: true);
-                Host.Renderer?.SetMediaSubFile(subtitlePath, "弹幕");
-            }
-
             if (contentType != 0 && contentType != 2)
                 await LoadVideoInfoAsync(oid, seasonId, epid, cid, cancellationToken);
 
@@ -1427,10 +1418,6 @@ public sealed class NvaClient
         catch (Exception ex)
         {
             Log.Warn($"NVA get_extra_info failed: {ex.Message}");
-        }
-        finally
-        {
-            if (File.Exists(pendingPath)) File.Delete(pendingPath);
         }
     }
 
@@ -1457,12 +1444,7 @@ public sealed class NvaClient
 
     public async Task<bool> SwitchQualityAsync(int qn, CancellationToken cancellationToken)
     {
-        if (_terminated)
-        {
-            return false;
-        }
-
-        if (qn <= 0) return false;
+        if (!_manager.IsNvaPlayback || _cid.Length == 0 || qn <= 0) return false;
         await _manager.CancelExtraInfoAsync();
         _desireQn = qn;
         var resolved = await ResolvePlayUrlAsync(cancellationToken);
@@ -1531,14 +1513,13 @@ public sealed class NvaClient
 
             var positionMs = (long)NvaCasting.PositionToSecond(Host.GetState("RelativeTimePosition")) * 1000;
             var durationMs = (long)NvaCasting.PositionToSecond(Host.GetState("CurrentMediaDuration")) * 1000;
-            var danmakuState = NvaJson.ParseBool(Host.GetState("DisplayCurrentSubtitle"), true);
 
             return new JsonObject
             {
                 ["playState"] = playState,
                 ["position"] = positionMs,
                 ["duration"] = durationMs,
-                ["danmakuState"] = danmakuState,
+                ["danmakuState"] = false,
                 ["title"] = $"{_title} {_titleP}".Trim(),
                 ["volume"] = Host.GetState("Volume"),
                 ["playItem"] = new JsonObject

@@ -50,7 +50,7 @@ internal static class PotPlayerProbe
         var startAt = Arg(args, "--start") ?? "0";
 
         DegradedCheck();
-        var ok = PlayerCheck(media, exe, shots, keepOpen, startAt);
+        var ok = PlayerCheck(media, exe, shots, keepOpen, startAt, args.Contains("--controls-only"));
 
         Say("");
         Say("== summary ==");
@@ -99,7 +99,7 @@ internal static class PotPlayerProbe
         }
     }
 
-    private static bool PlayerCheck(string media, string? exeHint, string shots, bool keepOpen, string startAt)
+    private static bool PlayerCheck(string media, string? exeHint, string shots, bool keepOpen, string startAt, bool controlsOnly)
     {
         var settings = AppSettings.Load();
         var resolved = PotPlayerRenderer.ResolveExecutable(settings);
@@ -152,6 +152,12 @@ internal static class PotPlayerProbe
 
             Focus(hwnd);
             Thread.Sleep(4000);
+
+            if (controlsOnly)
+            {
+                VerifyControls(renderer, sink, hwnd);
+                return Checks.All(c => c.Ok);
+            }
 
             if (startAt != "0")
             {
@@ -213,7 +219,7 @@ internal static class PotPlayerProbe
             Shot(hwnd, shots, "05-volume-60");
             Say($"state      : Volume={sink.GetState("Volume")}");
             renderer.SetMediaVolume(98);
-            Say($"state      : Volume={sink.GetState("Volume")} (98 is below the 5% hotkey step, deferred)");
+            Say($"state      : Volume={sink.GetState("Volume")} (exact message control)");
             renderer.SetMediaVolume(60);
             Check("volume:state", sink.GetState("Volume") == "60", $"Volume={sink.GetState("Volume")}");
 
@@ -277,6 +283,108 @@ internal static class PotPlayerProbe
             }
         }
     }
+
+    private static void VerifyControls(PotPlayerRenderer renderer, TraceSink sink, IntPtr hwnd)
+    {
+        long Read(int command)
+        {
+            if (SendMessageTimeout(hwnd, 0x400, new IntPtr(command), IntPtr.Zero, 0x22, 1000, out var value) == IntPtr.Zero)
+                throw new InvalidOperationException($"message 0x{command:X} timed out");
+            return value.ToInt64();
+        }
+        GetWindowRect(hwnd, out var launchRect);
+        var launchLayout = (int)typeof(PotPlayerRenderer).GetField("_layoutPasses", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!.GetValue(renderer)!;
+        Check("window:startup-layout", launchLayout == 0, $"remaining layout passes={launchLayout}, rect={launchRect.Left},{launchRect.Top},{launchRect.Right},{launchRect.Bottom}");
+        renderer.SetMediaPause();
+        renderer.SetMediaPause();
+        Check("message:pause-idempotent", Read(0x5006) == 1, "status=" + Read(0x5006));
+        foreach (var volume in new[] { 0, 37, 98, 60 })
+        {
+            renderer.SetMediaVolume(volume);
+            Check("message:volume-" + volume, Read(0x5000) == volume, "actual=" + Read(0x5000));
+        }
+        renderer.SetMediaMute(true);
+        renderer.SetMediaMute(true);
+        Check("message:mute-idempotent", Read(0x5011) == 1, "mute=" + Read(0x5011));
+        renderer.SetMediaMute(false);
+        Check("message:unmute", Read(0x5011) == 0, "mute=" + Read(0x5011));
+        renderer.SetMediaPosition("00:05:00");
+        Thread.Sleep(500);
+        Check("message:seek", Math.Abs(Read(0x5004) - 300000) < 2000, "position-ms=" + Read(0x5004));
+        if (Read(0x5015) >= 200)
+        {
+            renderer.SetMediaSpeed(1.5);
+            Check("message:speed", Read(0x5015) == 1500, "speed=" + Read(0x5015));
+            renderer.SetMediaSpeed(1);
+        }
+        else Say("INFO  playback speed interface unavailable in this installed version");
+        renderer.SetMediaResume();
+        renderer.SetMediaResume();
+        Check("message:resume-idempotent", Read(0x5006) == 2, "status=" + Read(0x5006));
+        Thread.Sleep(1500);
+        Check("message:progress-readback", Math.Abs(MediaTime.ToSeconds(sink.GetState("RelativeTimePosition")) - Read(0x5004) / 1000d) < 2,
+            "reported=" + sink.GetState("RelativeTimePosition") + " actual-ms=" + Read(0x5004));
+
+        var apply = typeof(PotPlayerRenderer).Assembly.GetType("Macast.Core.Renderer.PotPlayerWindow")!
+            .GetMethod("Apply", System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic)!;
+        bool Place(int position, int size, bool topmost)
+        {
+            var ok = false;
+            for (var i = 0; i < 4 && !ok; i++)
+            {
+                ok = (bool)apply.Invoke(null, new object[] { hwnd, (int)Read(0x6030), (int)Read(0x6031), position, size, topmost })!;
+                Thread.Sleep(300);
+            }
+            return ok;
+        }
+        var monitor = new MONITORINFO { Size = Marshal.SizeOf<MONITORINFO>() };
+        GetMonitorInfo(MonitorFromWindow(hwnd, 2), ref monitor);
+        foreach (var position in new[] { 0, 1, 2, 3, 4 })
+        {
+            var ok = Place(position, 1, true);
+            GetWindowRect(hwnd, out var r);
+            var left = r.Left < (monitor.Work.Left + monitor.Work.Right - (r.Right - r.Left)) / 2;
+            var upper = r.Top < (monitor.Work.Top + monitor.Work.Bottom - (r.Bottom - r.Top)) / 2;
+            var centered = Math.Abs((r.Left + r.Right) - (monitor.Work.Left + monitor.Work.Right)) <= 4;
+            Check("window:position-" + position, ok && position switch { 0 => left && upper, 1 => left && !upper, 2 => !left && upper, 3 => !left && !upper, _ => centered },
+                $"rect={r.Left},{r.Top},{r.Right},{r.Bottom}");
+        }
+        var previousWidth = 0;
+        foreach (var size in new[] { 0, 1, 2, 3 })
+        {
+            var ok = Place(4, size, false);
+            GetWindowRect(hwnd, out var r);
+            var width = r.Right - r.Left;
+            Check("window:size-" + size, ok && (size == 3 || width >= previousWidth) && r.Left >= monitor.Work.Left && r.Right <= monitor.Work.Right && r.Top >= monitor.Work.Top && r.Bottom <= monitor.Work.Bottom,
+                $"size={width}x{r.Bottom - r.Top}");
+            previousWidth = width;
+        }
+        Check("window:topmost", Place(4, 1, true) && (GetWindowLongPtr(hwnd, -20).ToInt64() & 8) != 0, "topmost on");
+        Check("window:notopmost", Place(4, 1, false) && (GetWindowLongPtr(hwnd, -20).ToInt64() & 8) == 0, "topmost off");
+        var fullOk = Place(4, 4, false);
+        GetWindowRect(hwnd, out var full);
+        Check("window:fullscreen", fullOk && full.Left <= monitor.Monitor.Left + 2 && full.Right >= monitor.Monitor.Right - 2, "fullscreen rect");
+        Check("window:fullscreen-idempotent", Place(4, 4, false), "repeat fullscreen");
+        Check("window:exit-fullscreen", Place(4, 1, false), "return to normal");
+        Place(0, 2, false);
+        GetWindowRect(hwnd, out var manual);
+        Thread.Sleep(2200);
+        GetWindowRect(hwnd, out var unchanged);
+        Check("window:manual-layout-preserved", manual.Left == unchanged.Left && manual.Top == unchanged.Top && manual.Right == unchanged.Right, "timer does not override later manual moves");
+        renderer.SetMediaStop();
+        Check("stop:owned-process-exit", renderer.PlayerProcessId is null, "dedicated process closed");
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MONITORINFO { public int Size; public RECT Monitor, Work; public uint Flags; }
+    [DllImport("user32.dll")]
+    private static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint flags);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern bool GetMonitorInfo(IntPtr monitor, ref MONITORINFO info);
+    [DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW")]
+    private static extern IntPtr GetWindowLongPtr(IntPtr hwnd, int index);
+    [DllImport("user32.dll")]
+    private static extern IntPtr SendMessageTimeout(IntPtr hwnd, uint message, IntPtr wParam, IntPtr lParam, uint flags, uint timeout, out IntPtr result);
 
     private static string? Arg(string[] args, string name)
     {

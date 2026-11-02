@@ -36,6 +36,7 @@ public sealed class SsdpServer : IAsyncDisposable
     public bool Running => _running;
     public int HttpPort => _httpPort;
     public int SsdpPort => _ssdpPort;
+    public bool AdvertiseNva { get; set; }
 
     public async Task StartAsync(int httpPort, IReadOnlyList<InterfaceAddress> addresses,
         CancellationToken cancellationToken = default)
@@ -161,6 +162,11 @@ public sealed class SsdpServer : IAsyncDisposable
         AddDevice("urn:schemas-upnp-org:service:AVTransport:1",
             "urn:schemas-upnp-org:service:AVTransport:1",
             $"{baseUsn}::urn:schemas-upnp-org:service:AVTransport:1");
+        if (AdvertiseNva)
+        {
+            const string nva = "urn:app-bilibili-com:service:NirvanaControl:3";
+            AddDevice(nva, nva, $"{baseUsn}::{nva}");
+        }
     }
 
     private void AddDevice(string key, string st, string usn)
@@ -317,6 +323,8 @@ public sealed class SsdpServer : IAsyncDisposable
         foreach (var device in _devices.Values)
         {
             if (!string.Equals(device.St, searchTarget, StringComparison.OrdinalIgnoreCase) &&
+                !(searchTarget.EndsWith(":*", StringComparison.Ordinal) &&
+                  device.St.StartsWith(searchTarget[..^1], StringComparison.OrdinalIgnoreCase)) &&
                 !string.Equals(searchTarget, "ssdp:all", StringComparison.OrdinalIgnoreCase))
             {
                 continue;

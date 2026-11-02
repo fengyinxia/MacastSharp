@@ -1,4 +1,7 @@
 using System.Text;
+using System.Text.Json;
+using System.Text.Json.Nodes;
+using System.Xml.Linq;
 using Macast.Core.Plugins;
 using Macast.Core.Renderer;
 using Macast.Core.Server;
@@ -64,7 +67,7 @@ public sealed class NvaProtocolService : IProtocolService, INvaCastingHost
 
     public AppSettings Settings => _settings;
 
-    public string Id => "NVA";
+    public string Id => "Auto";
 
     public string Description => _description;
 
@@ -84,7 +87,7 @@ public sealed class NvaProtocolService : IProtocolService, INvaCastingHost
         await _server.StartAsync(preferredPort, cancellationToken);
         RefreshDescription();
         Casting.Start();
-        Log.Info($"NVA protocol ready on port {Port}");
+        Log.Info($"DLNA + NVA automatic service ready on port {Port}");
     }
 
     public async Task StopAsync()
@@ -107,11 +110,17 @@ public sealed class NvaProtocolService : IProtocolService, INvaCastingHost
     {
         var description = DeviceDescription.Build(_settings, HeaderExtra, ServiceExtra);
         _description = ApplyBilibiliBranding(description);
+        // The Android client gates its TV controls on this exact friendly-name marker.
+        var name = _settings.FriendlyName;
+        var nvaName = name.Contains("我的小电视", StringComparison.Ordinal)
+            ? name : $"我的小电视 · {name}";
+        _description = _description.Replace($"<friendlyName>{DeviceDescription.Escape(name)}</friendlyName>",
+            $"<friendlyName>{DeviceDescription.Escape(nvaName)}</friendlyName>", StringComparison.Ordinal);
     }
 
     /// <summary>
     /// nirvana.py build_description replaces the stock manufacturer/model fields with the
-    /// bilibili TV ones so the client recognises the device as 云视听小电视.
+    /// bilibili TV ones. TV controls additionally require the friendly-name marker above.
     /// </summary>
     private static string ApplyBilibiliBranding(string description)
     {
@@ -133,7 +142,7 @@ public sealed class NvaProtocolService : IProtocolService, INvaCastingHost
     public void SetState(string name, string value)
     {
         // Only forward real changes: renderers echo state back (mpv observe events),
-        // and every echo used to re-broadcast OnDanmakuSwitch / OnProgress.
+        // and every echo used to re-broadcast progress events.
         var previous = _dlna.GetState(name);
         _dlna.SetState(name, value);
         if (!string.Equals(previous, value, StringComparison.Ordinal))
@@ -247,6 +256,22 @@ public sealed class NvaProtocolService : IProtocolService, INvaCastingHost
             return Xml(_description);
         }
 
+        if (string.Equals(path, "/health", StringComparison.OrdinalIgnoreCase))
+        {
+            var response = new HttpResponseData
+            {
+                Body = JsonSerializer.SerializeToUtf8Bytes(new
+                {
+                    status = "ok", port = Port, friendlyName = _settings.FriendlyName,
+                    usn = _settings.GetUsn(), version = _settings.Version,
+                    renderer = Renderer?.Name, mpv = Renderer?.Available ?? false,
+                    protocol = Id
+                })
+            };
+            response.Headers["Content-Type"] = "application/json; charset=utf-8";
+            return response;
+        }
+
         if (path.StartsWith("/dlna/", StringComparison.OrdinalIgnoreCase))
         {
             return ServeAsset(path["/dlna/".Length..], path);
@@ -259,7 +284,7 @@ public sealed class NvaProtocolService : IProtocolService, INvaCastingHost
     private static HttpResponseData ServeAsset(string name, string requestPath)
     {
         if (name.Length == 0 || name.Contains('/') || name.Contains('\\') ||
-            name.Contains("..", StringComparison.Ordinal))
+            name.Contains("..", StringComparison.Ordinal) || name.Contains(':'))
         {
             Log.Warn($"NVA: rejected asset path '{requestPath}'");
             return NotFound();
@@ -289,9 +314,7 @@ public sealed class NvaProtocolService : IProtocolService, INvaCastingHost
     {
         try
         {
-            var payload = string.Equals(service, NirvanaControl, StringComparison.Ordinal)
-                ? await Actions.CallAsync(body, cancellationToken)
-                : _dlna.Call(body);
+            var payload = await CallSoapAsync(body, cancellationToken);
 
             var response = new HttpResponseData { Body = payload };
             response.Headers["Content-Type"] = "text/xml; charset=\"utf-8\"";
@@ -310,6 +333,38 @@ public sealed class NvaProtocolService : IProtocolService, INvaCastingHost
             fault.Headers["Content-Type"] = "text/xml; charset=\"utf-8\"";
             return fault;
         }
+    }
+
+    /// <summary>Routes SOAP by its action namespace; all playback changes share the NVA command lock.</summary>
+    public async Task<byte[]> CallSoapAsync(byte[] body, CancellationToken cancellationToken = default)
+    {
+        XNamespace soap = "http://schemas.xmlsoap.org/soap/envelope/";
+        var action = XDocument.Parse(Encoding.UTF8.GetString(body)).Root?.Element(soap + "Body")?.Elements().FirstOrDefault()
+            ?? throw new InvalidDataException("SOAP body has no action element");
+        if (action.Name.NamespaceName == NvaActions.ServiceNamespace)
+            return await Actions.CallAsync(body, cancellationToken);
+
+        await Casting.Commands.WaitAsync(cancellationToken);
+        try
+        {
+            if (action.Name == XName.Get("SetAVTransportURI", "urn:schemas-upnp-org:service:AVTransport:1"))
+            {
+                var uri = action.Elements().FirstOrDefault(e => e.Name.LocalName == "CurrentURI")?.Value ?? string.Empty;
+                var extension = BilibiliApi.ParseNvaExtension(uri);
+                if (uri.StartsWith("bilibili:", StringComparison.OrdinalIgnoreCase) || extension is not null)
+                {
+                    var client = new NvaClient(Casting, string.Empty, string.Empty);
+                    await client.HandlePlayUrlAsync(0, new JsonObject { ["url"] = uri }, cancellationToken);
+                    return Encoding.UTF8.GetBytes("<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\"><s:Body><u:SetAVTransportURIResponse xmlns:u=\"urn:schemas-upnp-org:service:AVTransport:1\"/></s:Body></s:Envelope>");
+                }
+                await Casting.ReleasePlaybackAsync();
+                Renderer?.SetMediaSpeed(1);
+                SetState("TransportPlaySpeed", "1");
+                SetState("CurrentMediaDuration", "00:00:00");
+            }
+            return _dlna.Call(body);
+        }
+        finally { Casting.Commands.Release(); }
     }
 
     private HttpResponseData HandleEvent(string service, HttpRequestData request, bool unsubscribe)

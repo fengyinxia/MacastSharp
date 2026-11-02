@@ -35,7 +35,7 @@ public sealed class MpvRendererPlugin : IRendererPlugin
 
         public override string Title => "MPV";
 
-        public override string Description => "使用自行安装的 MPV，通过 IPC 同步播放状态，支持进度、音量、字幕、倍速；Live 共用此路径";
+        public override string Description => "使用自行安装的 MPV，通过 IPC 同步播放状态，支持进度、音量、字幕、倍速";
 
         public override string Author => "xfangfang";
 
@@ -46,7 +46,7 @@ public sealed class MpvRendererPlugin : IRendererPlugin
         public override IReadOnlyList<PluginSettingDescriptor> Settings => new[]
         {
             PluginSettingDescriptor.Path("Mpv_Path", "MPV 程序路径", "",
-                "请选择自行安装的 mpv.exe；留空时自动查找程序目录 bin 和 PATH。Live 也使用此路径。")
+                "请选择自行安装的 mpv.exe；留空时自动查找程序目录 bin 和 PATH。")
         };
 
         public override string StatusText(AppSettings settings) => ResolveMpv(settings) is not null

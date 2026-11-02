@@ -72,10 +72,8 @@
 | 重连风暴 | 手机同时开两条连接（不同 Session），旧代码见到“同 UUID 不同 Session”就终止另一条，手机立刻重连，形成死循环并不断广播空状态 | 允许同 UUID 多连接并存；新连接继承旧连接的播放状态，不再互相终止 |
 | `GetPlayInfo` 解析失败 | 回的是自定义 JSON | 按手机模型输出 `LinkPlayInfoTotal`（位置/时长毫秒） |
 | `GetPlayInfo` 命令无响应 | NVA 命令落到 default 回空 | 增加 `c0` 回包分支 |
-| 弹幕开关无效 | `SwitchDanmaku` 用字符串比较 `"false"`（手机发的是 JSON 布尔），且不改状态、不广播；手机端只在 `open` 与本地缓存不同时才下发，连接被踢时命令直接丢失 | 按 `NvaJson.GetBool` 解析、写 `DisplayCurrentSubtitle` 状态（触发 `OnDanmakuSwitch` 广播）、同步 mpv `sub-visibility` |
 
-弹幕链路：`GetExtraInfoAsync` 下载 XML → 生成 `macast.ass`（本次会话 125 KB / 1200 条 Dialogue）→ mpv `sub-add <ass> select`；开关只切 `sub-visibility`，不重新下载。
-另外 `NvaProtocolService.SetState` 改成只在值变化时广播，消掉 mpv observe 回显导致的重复 `OnDanmakuSwitch`。
+弹幕实现现已按用户要求移除：不再下载 XML、转换 ASS 或将 `macast.ass` 加载到播放器。`SwitchDanmaku` / `SetDanmakuSwitch` / `SendDanmaku` / `AppendDanmaku` 仅保留兼容应答，不触发字幕开关或 OSD；播放信息中的 `danmakuState` 固定为 false，`GetDanmaku` 返回空内容。普通字幕功能不受影响。
 
 ## 5. 验证
 
@@ -86,7 +84,7 @@
 
 匿名输出：`curQn=64`，列 112/80/64/32/16；带真实 key + TV 身份：`curQn=80`。
 
-本地端到端（真实 key + 真实视频 + 内置 mpv）：
+历史本地端到端记录（真实 key + 真实视频 + mpv；弹幕功能现已移除，以下仅保留当时验证证据）：
 
     NVA playurl: curQn=80 desireQn=80 dash=yes accessKey=yes
     GetPositionInfo → RelTime=0:00:04 / Duration=0:02:03 / NrTracks=3（video+audio+弹幕字幕）
@@ -102,14 +100,36 @@
 
 现场诊断显示 PotPlayer 请求 `qn=80`、携带手机凭据且 TV 身份正确，但非 DASH 请求被接口返回 `quality=64`。此前只有 MPV/Live 声明外置音轨能力。现在 PotPlayer 也请求 DASH，将视频 URL 和音频 URL 一起传入，并使用 `/same` 将它们作为同一播放项的多路流打开，保留起播位置。不修改服务端实际授予的清晰度。用户已在现场复测并确认修复有效。临时请求参数、凭据存在性与清晰度诊断打印已移除，正式版保留必要错误日志。
 
-## 8. 状态与播放修复
+## 8. 设备名称与弹幕入口
 
-- 两条控制连接共享当前视频、清晰度、倍速及弹幕开关；真正断线后重连也能查询原播放信息。修改播放的命令串行执行，避免两个连接互相覆盖。
-- 切视频或清晰度前取消并等待旧字幕/元数据任务；字幕先写独立临时文件，确认任务未取消后再替换。停止协议时清理后台任务。
+对当前手机 APK 的 `classes16.dex` 定向反编译确认：
+
+- `NirvanaEngine.b.getName()` 取发现设备的 friendly name，而非 `modelDescription`。
+- `v03.j.v()` 用名称是否包含 **“我的小电视”** 判断 NVA 设备是否属于 B 站 TV；仅改厂商或写“云视听小电视”不能满足该条件。
+- `ProjectionNewUiTvControlWidget.M()` 和 `ProjectionFullScreenFragment.o.b()` 使用该判断决定是否真正调用 `danmakuToggle`。
+- `NirvanaEngine` 搜索 `urn:app-bilibili-com:service:NirvanaControl:*`；此前仅在 XML 声明服务，SSDP 未公告。
+
+统一服务将发现名称设为 `我的小电视 · <用户设备名>`，已有标记时不重复添加，不改保存的设备名。所有客户端共用同一描述、UUID 和端口，因此普通 DLNA 客户端也看到此名称。SSDP 同时公告标准 DLNA 服务与 NirvanaControl:3，并接受后者的通配查询。手机可能缓存旧名称，需要重新搜索设备。
+
+设备识别修复保留，但投屏弹幕渲染已按用户要求移除。手机可能仍显示其内置弹幕按钮；接收端不再执行该按钮对应的渲染操作，也不会加载旧弹幕文件。
+
+## 9. DLNA + NVA 自动模式
+
+- 对外只有一个 `Auto` 协议插件；旧 `DLNA` / `NVA` 配置和 CLI 参数均解析到同一自动服务，设置页不再提供协议切换。
+- 共用原 NVA socket 监听与内置 DLNA 状态，按 SOAP action 命名空间、NVA 建链方法分流，标准 SOAP/GENA 和 `/health` 保留。
+- 标准 `SetAVTransportURI` 中的 `bilibili:` 或有效 NVA 扩展链接转交 B站 playurl 解析；普通 URL 直接播放。无 NVA 长连接也可解析链接、切换清晰度及连播。
+- DLNA SOAP 与 NVA 播放命令使用同一串行锁。新播放接管时取消旧元数据和待执行连播，清空旧 B站视频、凭据与清晰度上下文，不重新启动监听或渲染器。
+- 普通 DLNA 内容接管后，旧 NVA 连接的暂停、恢复、停止、跳转、倍速和清晰度命令不再操纵该内容；音量仍是共用设备级控制。
+- 实际手机/第三方 DLNA 客户端兼容性仍需现场验证；回归覆盖两种协议双向接管、并发提交、SOAP B站链接以及旧配置兼容。
+
+## 10. 状态与播放修复
+
+- 两条控制连接共享当前视频、清晰度及倍速；真正断线后重连也能查询原播放信息。修改播放的命令串行执行，避免两个连接互相覆盖。
+- 切视频或清晰度前取消并等待旧元数据任务，停止协议时清理后台任务。弹幕下载与字幕生成任务已删除。
 - 连播使用条目的 object ID，普通视频清空旧番剧 epId，普通视频列表不再把 aid 当作 epId。
 - 同时支持 `nva_ext` 和 `_nva_ext_`；短键 `key/sid/eid/ct/sk` 保持兼容。
 - 手机传入的凭据优先；未携带时使用设备保存且未过期的凭据。新登录记录过期时间，旧配置无过期时间时保留兼容；服务端提前撤销凭据仍会返回接口错误。
 - `--probe-playurl` 默认与插件使用相同 TV 身份；可显式传旧客户端参数作对比。
-- 多分段 durl 在 MPV / Live 上使用 EDL 拼为单一时间线；不支持分段的播放器明确报错，不再静默只播第一段。
+- 多分段 durl 在 MPV 上使用 EDL 拼为单一时间线；不支持分段的播放器明确报错，不再静默只播第一段。Live/IPTV 播放器及频道菜单已移除，不影响 B站 NVA 媒体解析。
 - 回归使用伪造 HTTP 响应，不访问用户账号；并未因此验证真实登录、会员清晰度或手机兼容性。
-- 实时发送弹幕、镜像投屏仍未实现，不属于本轮缺陷修复，不宣称支持。
+- 投屏弹幕已移除；镜像投屏仍未实现，不宣称支持。

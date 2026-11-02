@@ -20,7 +20,6 @@ internal sealed class NvaPlaybackState
     public int PlayUrlType = 1;
     public int ContentType = 1;
     public bool IsPortrait;
-    public bool DanmakuOpen = true;
     public double Speed = 1;
     public JsonObject Qn = new();
 }

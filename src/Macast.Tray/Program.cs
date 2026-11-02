@@ -12,6 +12,7 @@ internal static class Program
         ApplicationConfiguration.Initialize();
         if (args.Contains("--selftest")) return SettingsSelfTest.Run();
         Log.LogFile = Path.Combine(AppSettings.ConfigDir, "macast-cs.log");
+        Log.ConfigureRetention(AppSettings.Load().GetInt("LogRetentionDays", Log.DefaultRetentionDays));
         Log.Info($"Macast tray starting, version {AssetPaths.Version}");
 
         // "--settings" opens the desktop settings window directly (used by the

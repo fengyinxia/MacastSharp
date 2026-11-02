@@ -16,6 +16,34 @@ internal static class NvaTests
 
     public static async Task RunAsync(List<string> failures)
     {
+        await CheckAsync("NVA TV name and disabled danmaku compatibility", async () =>
+        {
+            using var fixture = new Fixture();
+            await using var service = fixture.CreateService();
+            service.Settings.Set("DLNA_FriendlyName", "Macast & PC");
+            service.RefreshDescription();
+            var xml = System.Xml.Linq.XDocument.Parse(service.Description);
+            System.Xml.Linq.XNamespace ns = "urn:schemas-upnp-org:device-1-0";
+            var device = xml.Root!.Element(ns + "device")!;
+            Require(device.Element(ns + "friendlyName")!.Value == "我的小电视 · Macast & PC", "Android TV name marker or escaping missing");
+            Require(service.Settings.FriendlyName == "Macast & PC", "NVA changed stored DLNA name");
+            Require(!Macast.Core.Upnp.DeviceDescription.Build(service.Settings).Contains("我的小电视", StringComparison.Ordinal), "TV branding leaked into DLNA");
+            service.Settings.Set("DLNA_FriendlyName", "我的小电视 · living room");
+            service.RefreshDescription();
+            Require(service.Description.Contains("<friendlyName>我的小电视 · living room</friendlyName>", StringComparison.Ordinal), "TV name marker duplicated");
+            var client = Attach(service.Casting, "danmaku");
+            service.SetState("DisplayCurrentSubtitle", "true");
+            await client.HandleCommandAsync("SwitchDanmaku", 1, new JsonObject { ["open"] = false }, Token);
+            await client.HandleCommandAsync("SwitchDanmaku", 2, new JsonObject { ["open"] = true }, Token);
+            await client.HandleCommandAsync("SendDanmaku", 3, new JsonObject { ["content"] = "ignored" }, Token);
+            await service.Actions.CallAsync(Soap("SetDanmakuSwitch", "<DesiredSwitch>false</DesiredSwitch>"), Token);
+            await service.Actions.CallAsync(Soap("AppendDanmaku", "<Content>ignored</Content>"), Token);
+            Require(service.GetState("DisplayCurrentSubtitle") == "true", "danmaku command changed normal subtitle state");
+            Require(!client.DescribePlayInfoTotal()["danmakuState"]!.GetValue<bool>(), "removed danmaku advertised as enabled");
+            var info = Encoding.UTF8.GetString(await service.Actions.CallAsync(Soap("GetDanmaku"), Token));
+            Require(!info.Contains("macast.ass", StringComparison.Ordinal), "legacy subtitle path exposed");
+        }, failures);
+
         await CheckAsync("NVA shared playback and reconnect", async () =>
         {
             using var fixture = new Fixture();
@@ -75,9 +103,11 @@ internal static class NvaTests
                 new object[] { "PotPlayerMini64.exe", resolved!.Url!, 42d, resolved.AudioUrl! })!;
             Require(info.ArgumentList[0] == resolved.Url && info.ArgumentList[1] == resolved.AudioUrl, "stream arguments incomplete");
             Require(info.ArgumentList.Contains("/same") && info.ArgumentList.Contains("/seek=0:00:42"), "combined playback or resume argument missing");
+            Require(info.ArgumentList.Contains("/new") && info.ArgumentList.Any(a => a.StartsWith("/volume=")), "dedicated instance or initial volume missing");
+            Require(!info.ArgumentList.Any(a => a.StartsWith("/sub=", StringComparison.Ordinal)), "legacy danmaku loaded by PotPlayer");
         }, failures);
 
-        await CheckAsync("NVA speed and danmaku survive quality change", async () =>
+        await CheckAsync("NVA speed survives quality change without danmaku", async () =>
         {
             using var fixture = new Fixture();
             await using var service = fixture.CreateService();
@@ -86,13 +116,15 @@ internal static class NvaTests
             renderer.Start();
             var client = Attach(service.Casting, "speed");
             var play = Play("300");
-            play["danmakuSwitchSave"] = false;
+            play["danmakuSwitchSave"] = true;
             await client.HandleCommandAsync("Play", 1, play, Token);
-            Require(service.GetState("DisplayCurrentSubtitle") == "false", "initial danmaku preference ignored");
+            Require(!client.DescribePlayInfoTotal()["danmakuState"]!.GetValue<bool>(), "phone enabled removed danmaku");
             await client.HandleCommandAsync("SwitchSpeed", 2, new JsonObject { ["speed"] = 1.5 }, Token);
             await client.HandleCommandAsync("SwitchQn", 3, new JsonObject { ["qn"] = 80 }, Token);
             Require(service.GetState("TransportPlaySpeed") == "1.5", "quality switch reset speed");
-            Require(service.GetState("DisplayCurrentSubtitle") == "false", "quality switch reset danmaku");
+            Require(!client.DescribePlayInfoTotal()["danmakuState"]!.GetValue<bool>(), "quality switch enabled danmaku");
+            await service.Casting.StopBackgroundAsync();
+            Require(fixture.DanmakuRequests == 0, "playback still downloads danmaku");
         }, failures);
 
         await CheckAsync("NVA episode identifiers reset", async () =>
@@ -126,6 +158,89 @@ internal static class NvaTests
             { ["url"] = "bilibili://video?_nva_ext_=" + Uri.EscapeDataString(payload.ToJsonString()) }, Token);
             Require(client.DescribePlay()["roomId"]!.GetValue<string>() == "0", "live room leaked into video");
             Require(fixture.LastCid == "20", "legacy content not resolved");
+        }, failures);
+
+        await CheckAsync("automatic DLNA and NVA takeover on one listener", async () =>
+        {
+            using var fixture = new Fixture { DelayOldMetadata = true };
+            await using var service = fixture.CreateService();
+            using var renderer = new MpvRenderer(new RendererContext(service.Settings, service, true));
+            service.Renderer = renderer;
+            await service.StartAsync(0);
+            renderer.Start();
+            using var http = new HttpClient { BaseAddress = new Uri($"http://127.0.0.1:{service.Port}") };
+            var port = service.Port;
+            var client = Attach(service.Casting, "mixed");
+            var old = Play("old");
+            old["aid"] = "old";
+            old["contentType"] = 1;
+            old["userDesireSpeed"] = 1.5;
+            await client.HandleCommandAsync("Play", 1, old, Token);
+            await fixture.OldStarted.Task.WaitAsync(TimeSpan.FromSeconds(3));
+            service.Casting.SetPlayList(new[]
+            { new NvaPlayItem("1", "1", "old", "0", "old", false), new NvaPlayItem("2", "2", "stale", "0", "stale", false) }, 0);
+            await StandardSoapAsync(http, "SetAVTransportURI", "<CurrentURI>https://example.invalid/dlna.mp4</CurrentURI><CurrentURIMetaData/>");
+            await StandardSoapAsync(http, "Play", "<Speed>1</Speed>");
+            Require(fixture.OldCancelled, "DLNA did not cancel old NVA metadata");
+            Require(client.DescribePlay()["cid"]!.GetValue<string>() == "", "DLNA kept old Bilibili video");
+            Require(!await service.Casting.ApplyQualityAsync(80, Token), "stale quality request can steal DLNA playback");
+            await client.HandleCommandAsync("Pause", 2, null, Token);
+            Require(service.GetState("TransportState") == "PLAYING", "stale NVA pause affected DLNA");
+            Require(service.GetState("TransportPlaySpeed") == "1", "DLNA inherited NVA speed");
+            service.SetState("TransportState", "NO_MEDIA_PRESENT");
+            var next = (Task)typeof(NvaCasting).GetField("_nextTask", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(service.Casting)!;
+            await next.WaitAsync(TimeSpan.FromSeconds(3));
+            Require(fixture.LastCid == "old", "old NVA playlist resumed after DLNA takeover");
+
+            var payload = new JsonObject
+            { ["ver"] = 2, ["content"] = new JsonObject { ["aid"] = "10", ["cid"] = "20", ["ct"] = 2, ["sk"] = "12" } };
+            var link = "bilibili://video?nva_ext=" + Uri.EscapeDataString(payload.ToJsonString());
+            await StandardSoapAsync(http, "SetAVTransportURI", "<CurrentURI>" + System.Security.SecurityElement.Escape(link) + "</CurrentURI><CurrentURIMetaData/>");
+            Require(fixture.LastCid == "20" && service.GetState("CurrentTrackURI") == "https://example.invalid/video.mp4", "SOAP Bilibili link was not resolved");
+            await StandardSoapAsync(http, "Pause", "");
+            Require(service.GetState("TransportState") == "PAUSED_PLAYBACK", "DLNA controls cannot control NVA item");
+            await client.HandleCommandAsync("Resume", 3, null, Token);
+            Require(service.GetState("TransportState") == "PLAYING", "NVA resume failed after DLNA pause");
+
+            await StandardSoapAsync(http, "SetAVTransportURI", "<CurrentURI>https://example.invalid/second.mp4</CurrentURI><CurrentURIMetaData/>");
+            await client.HandleCommandAsync("Play", 4, Play("30"), Token);
+            Require(client.DescribePlay()["cid"]!.GetValue<string>() == "30", "NVA could not take over DLNA");
+            Require(service.Port == port && ReferenceEquals(service.Renderer, renderer), "takeover restarted listener or renderer");
+            Require((await http.GetStringAsync("/health")).Contains("\"protocol\":\"Auto\"", StringComparison.Ordinal), "automatic health endpoint missing");
+        }, failures);
+
+        await CheckAsync("Bilibili SOAP playback works without NVA sockets", async () =>
+        {
+            using var fixture = new Fixture();
+            await using var service = fixture.CreateService();
+            using var renderer = new MpvRenderer(new RendererContext(service.Settings, service, true));
+            service.Renderer = renderer;
+            renderer.Start();
+            var payload = new JsonObject
+            { ["ver"] = 2, ["content"] = new JsonObject { ["aid"] = "10", ["cid"] = "20", ["ct"] = 2 } };
+            var link = "bilibili://video?nva_ext=" + Uri.EscapeDataString(payload.ToJsonString());
+            await service.CallSoapAsync(StandardSoap("SetAVTransportURI", "<CurrentURI>" + System.Security.SecurityElement.Escape(link) + "</CurrentURI><CurrentURIMetaData/>"), Token);
+            Require(service.Casting.ClientCount == 0 && fixture.LastCid == "20", "SOAP playback required a control socket");
+            Require(await service.Casting.ApplyQualityAsync(80, Token), "SOAP-originated item could not switch quality");
+            Require(service.GetState("TransportState") == "PLAYING", "SOAP-originated playback stopped");
+        }, failures);
+
+        await CheckAsync("cross-protocol playback commands are serialized", async () =>
+        {
+            using var fixture = new Fixture { DelayPlayUrl = true };
+            await using var service = fixture.CreateService();
+            using var renderer = new MpvRenderer(new RendererContext(service.Settings, service, true));
+            service.Renderer = renderer;
+            renderer.Start();
+            var client = Attach(service.Casting, "race");
+            var nva = client.HandleCommandAsync("Play", 1, Play("blocked"), Token);
+            await fixture.PlayUrlStarted.Task.WaitAsync(TimeSpan.FromSeconds(3));
+            var body = StandardSoap("SetAVTransportURI", "<CurrentURI>https://example.invalid/last.mp4</CurrentURI><CurrentURIMetaData/>");
+            var dlna = service.CallSoapAsync(body, Token);
+            Require(!dlna.IsCompleted, "DLNA bypassed shared command lock");
+            fixture.ContinuePlayUrl.TrySetResult();
+            await Task.WhenAll(nva, dlna).WaitAsync(TimeSpan.FromSeconds(3));
+            Require(service.GetState("CurrentTrackURI") == "https://example.invalid/last.mp4", "earlier NVA request overwrote newer DLNA item");
         }, failures);
 
         await CheckAsync("NVA saved login and expiry", async () =>
@@ -171,24 +286,40 @@ internal static class NvaTests
 
         await CheckAsync("NVA old background work is cancelled", async () =>
         {
-            using var fixture = new Fixture { DelayOldDanmaku = true };
+            using var fixture = new Fixture { DelayOldMetadata = true };
             await using var service = fixture.CreateService();
             var client = Attach(service.Casting, "background");
-            await client.HandleCommandAsync("Play", 1, Play("old"), Token);
+            var oldPlay = Play("old");
+            oldPlay["aid"] = "old";
+            oldPlay["contentType"] = 1;
+            await client.HandleCommandAsync("Play", 1, oldPlay, Token);
             await fixture.OldStarted.Task.WaitAsync(TimeSpan.FromSeconds(3));
-            await client.HandleCommandAsync("Play", 2, Play("new"), Token);
+            var newPlay = Play("new");
+            newPlay["aid"] = "new";
+            newPlay["contentType"] = 1;
+            await client.HandleCommandAsync("Play", 2, newPlay, Token);
             await fixture.NewFinished.Task.WaitAsync(TimeSpan.FromSeconds(3));
             var extraTask = (Task)typeof(NvaCasting).GetField("_extraTask", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(service.Casting)!;
             await extraTask.WaitAsync(TimeSpan.FromSeconds(3));
             await service.Casting.StopBackgroundAsync();
-            Require(fixture.OldCancelled, "old download kept running");
-            Require(File.ReadAllText(Path.Combine(AppSettings.ConfigDir, "macast.ass")).Contains("new-comment"), "stale subtitle replaced new video");
-            Require(!Directory.EnumerateFiles(AppSettings.ConfigDir, "macast.ass.*.tmp").Any(), "subtitle temporary file leaked");
+            Require(fixture.OldCancelled, "old metadata request kept running");
+            Require(fixture.DanmakuRequests == 0, "background work still downloads danmaku");
+            Require(!File.Exists(Path.Combine(AppSettings.ConfigDir, "macast.ass")), "playback generated danmaku subtitles");
         }, failures);
     }
 
     private static JsonObject Play(string cid) => new()
     { ["aid"] = "123", ["cid"] = cid, ["contentType"] = 2, ["userDesireQn"] = 80 };
+
+    private static byte[] StandardSoap(string action, string arguments) => Encoding.UTF8.GetBytes(
+        "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\"><s:Body>" +
+        $"<u:{action} xmlns:u=\"urn:schemas-upnp-org:service:AVTransport:1\"><InstanceID>0</InstanceID>{arguments}</u:{action}></s:Body></s:Envelope>");
+
+    private static async Task StandardSoapAsync(HttpClient http, string action, string arguments)
+    {
+        using var response = await http.PostAsync("/AVTransport/action", new ByteArrayContent(StandardSoap(action, arguments)));
+        Require(response.IsSuccessStatusCode, "SOAP failed: " + await response.Content.ReadAsStringAsync());
+    }
 
     private static byte[] Soap(string action, string arguments = "") => Encoding.UTF8.GetBytes(
         """<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body>""" +
@@ -210,7 +341,11 @@ internal static class NvaTests
         public HttpClient Http => _http;
         public bool MultipleSegments;
         public bool DashResponse;
-        public bool DelayOldDanmaku;
+        public bool DelayOldMetadata;
+        public bool DelayPlayUrl;
+        public TaskCompletionSource PlayUrlStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource ContinuePlayUrl { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public int DanmakuRequests;
         public bool OldCancelled;
         public TaskCompletionSource OldStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public TaskCompletionSource NewFinished { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -227,6 +362,11 @@ internal static class NvaTests
                     .ToDictionary(p => p[0], p => Uri.UnescapeDataString(p[1]));
                 LastQuery = query;
                 LastCid = query["cid"];
+                if (DelayPlayUrl && LastCid == "blocked")
+                {
+                    PlayUrlStarted.TrySetResult();
+                    await ContinuePlayUrl.Task.WaitAsync(cancellationToken);
+                }
                 LastKey = query["access_key"];
                 if (DashResponse && query.ContainsKey("fnval"))
                     return Json("""{"code":0,"data":{"quality":80,"dash":{"video":[{"id":80,"base_url":"https://example.invalid/video.m4s"}],"audio":[{"bandwidth":192000,"base_url":"https://example.invalid/audio.m4s"}]}}}""");
@@ -235,19 +375,20 @@ internal static class NvaTests
                 return Json("""{"code":0,"data":{"quality":80,"durl":[{"url":"https://example.invalid/video.mp4"}]}}""");
             }
             if (uri.AbsolutePath == "/x/tv/card/view_v2")
-                return Json("""{"code":0,"data":{"title":"series","auto_play":{"cid_list":[{"aid":"10","playurl_args":{"object_id":"10","cid":"20"},"title":"part"}]}}}""");
-            if (uri.Host == "comment.bilibili.com")
             {
-                if (DelayOldDanmaku && uri.AbsolutePath == "/old.xml")
+                if (DelayOldMetadata && uri.Query.Contains("object_id=old", StringComparison.Ordinal))
                 {
                     OldStarted.TrySetResult();
                     try { await Task.Delay(Timeout.Infinite, cancellationToken); }
                     catch (OperationCanceledException) { OldCancelled = true; throw; }
                 }
-                var response = new HttpResponseMessage(HttpStatusCode.OK)
-                { Content = new StringContent("""<i><d p="1,1,25,16777215,0,0,0,0">new-comment</d></i>""") };
-                if (uri.AbsolutePath == "/new.xml") NewFinished.TrySetResult();
-                return response;
+                if (uri.Query.Contains("object_id=new", StringComparison.Ordinal)) NewFinished.TrySetResult();
+                return Json("""{"code":0,"data":{"title":"series","auto_play":{"cid_list":[{"aid":"10","playurl_args":{"object_id":"10","cid":"20"},"title":"part"}]}}}""");
+            }
+            if (uri.Host == "comment.bilibili.com")
+            {
+                DanmakuRequests++;
+                throw new InvalidOperationException("danmaku must not be requested");
             }
             if (uri.AbsolutePath.EndsWith("/qrcode/poll"))
                 return Json("""{"code":0,"data":{"access_token":"fake-login","mid":"1","expires_in":3600}}""");
